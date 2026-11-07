@@ -129,6 +129,7 @@ Extension miễn phí và không có quảng cáo. Nếu thấy hữu ích, bạ
   <img src=".github/assets/donate-qr.png" alt="Mã QR ủng hộ binhake (MoMo / VietQR)" width="240" /><br/>
   <sub>Quét bằng app <b>MoMo</b> hoặc bất kỳ app ngân hàng nào (VietQR / napas 247)</sub><br/><br/>
   <a href="https://me.momo.vn/binhake" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/Ủng%20hộ%20qua-MoMo-ae2070?style=for-the-badge" alt="Ủng hộ qua MoMo" /></a>
+  <a href="https://paypal.me/snns07" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/Ủng%20hộ%20qua-PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white" alt="Ủng hộ qua PayPal" /></a>
 </p>
 
 Không tiện ủng hộ thì cho repo 1 ⭐ cũng là động lực lớn rồi!
@@ -239,6 +240,7 @@ This extension is free and ad-free. If it helps you, consider buying me a coffee
   <img src=".github/assets/donate-qr.png" alt="binhake donation QR code (MoMo / VietQR)" width="240" /><br/>
   <sub>Scan with <b>MoMo</b> or any Vietnamese banking app (VietQR / napas 247)</sub><br/><br/>
   <a href="https://me.momo.vn/binhake" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/Donate%20via-MoMo-ae2070?style=for-the-badge" alt="Donate via MoMo" /></a>
+  <a href="https://paypal.me/snns07" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/Donate%20via-PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate via PayPal" /></a>
 </p>
 
 A ⭐ on the repo helps a lot too!

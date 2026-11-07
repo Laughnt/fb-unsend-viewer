@@ -1539,6 +1539,14 @@ button {
   text-decoration: none;
 }
 
+.btn-paypal {
+  display: grid;
+  place-items: center;
+  background: #0070ba;
+  color: #ffffff;
+  text-decoration: none;
+}
+
 /* ===== Animation ===== */
 @keyframes livePulse {
   0% {
