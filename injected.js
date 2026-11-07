@@ -70,6 +70,8 @@
   const processedNodes = new WeakSet();
   const vaultMap = new Map();
   const contactNameMap = new Map();
+  const contactNicknameMap = new Map();
+  const contactAliasesMap = new Map();
   const contactAvatarMap = new Map();
   const threadNameMap = new Map();
   const seenE2EETexts = new Map();
@@ -693,14 +695,65 @@
     };
   }
 
+  function recordContactAlias(contactId, rawName, isNickname = false, threadId = '') {
+    const cleanId = contactId
+      ? String(contactId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '')
+      : '';
+    if (!cleanId || cleanId === '0' || typeof rawName !== 'string') return false;
+    const cleanName = unvaultString(rawName).trim();
+    if (
+      !cleanName ||
+      cleanName.length < 1 ||
+      cleanName.length > 80 ||
+      /^https?:\/\//i.test(cleanName) ||
+      isTechnicalString(cleanName) ||
+      isUnsendNoticeText(cleanName)
+    ) {
+      return false;
+    }
+    let changed = false;
+    if (!contactAliasesMap.has(cleanId)) {
+      contactAliasesMap.set(cleanId, new Set());
+    }
+    const aliasSet = contactAliasesMap.get(cleanId);
+    if (!aliasSet.has(cleanName)) {
+      aliasSet.add(cleanName);
+      changed = true;
+    }
+    if (isNickname) {
+      if (contactNicknameMap.get(cleanId) !== cleanName) {
+        contactNicknameMap.set(cleanId, cleanName);
+        changed = true;
+      }
+      const cleanTid = threadId
+        ? String(threadId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '')
+        : '';
+      if (cleanTid && cleanTid !== '0') {
+        const scopedKey = `${cleanTid}__${cleanId}`;
+        if (contactNicknameMap.get(scopedKey) !== cleanName) {
+          contactNicknameMap.set(scopedKey, cleanName);
+          changed = true;
+        }
+      }
+    }
+    return changed;
+  }
+
   let avatarEmitTimer = null;
   function scheduleEmitContactAvatars() {
     if (avatarEmitTimer) return;
     avatarEmitTimer = setTimeout(() => {
       avatarEmitTimer = null;
-      if (contactAvatarMap.size === 0) return;
+      if (contactAvatarMap.size === 0 && contactAliasesMap.size === 0) return;
+      const aliasesById = {};
+      for (const [id, set] of contactAliasesMap.entries()) {
+        if (id && set && set.size > 0) {
+          aliasesById[id] = Array.from(set);
+        }
+      }
       emitToContentScript('FB_CONTACT_AVATARS_UPDATED', {
-        byId: Object.fromEntries(contactAvatarMap.entries())
+        byId: Object.fromEntries(contactAvatarMap.entries()),
+        aliasesById
       });
     }, 350);
   }
@@ -862,7 +915,7 @@
           : await dbMod.LSDatabaseSingleton;
       if (rawDb?.tables && typeof rawDb.tables === 'object') {
         for (const tName of Object.keys(rawDb.tables)) {
-          if (/message|edit/i.test(tName) && rawDb.tables[tName]) {
+          if (/message|edit|participant|contact/i.test(tName) && rawDb.tables[tName]) {
             wrapReStoreTable(rawDb.tables[tName], tName);
           }
         }
@@ -871,26 +924,67 @@
       if (!contactsTable || typeof reqlMod.toArrayAsync !== 'function') return;
       lsContactsSynced = true;
       const rows = await reqlMod.toArrayAsync(reqlMod.fromTableAscending(contactsTable));
-      if (!Array.isArray(rows)) return;
       let added = 0;
-      for (const row of rows) {
-        if (!row || typeof row !== 'object') continue;
-        const cId = parseLSInt64(row.id) || (typeof row.id === 'string' ? row.id : '');
-        const cName = typeof row.name === 'string' ? unvaultString(row.name).trim() : '';
-        const rawPic =
-          row.profilePictureLargeUrl ||
-          row.profilePictureUrl ||
-          row.profilePictureFallbackUrl ||
-          '';
-        const picUrl = typeof rawPic === 'string' ? unvaultString(rawPic).trim() : '';
-        if (cId && cName) {
-          contactNameMap.set(cId, cName);
-        }
-        if (cId && picUrl && /^https?:\/\//i.test(picUrl)) {
-          contactAvatarMap.set(cId, picUrl);
-          added++;
+      if (Array.isArray(rows)) {
+        for (const row of rows) {
+          if (!row || typeof row !== 'object') continue;
+          const cId = parseLSInt64(row.id) || (typeof row.id === 'string' ? row.id : '');
+          const cName = typeof row.name === 'string' ? unvaultString(row.name).trim() : '';
+          const rawPic =
+            row.profilePictureLargeUrl ||
+            row.profilePictureUrl ||
+            row.profilePictureFallbackUrl ||
+            '';
+          const picUrl = typeof rawPic === 'string' ? unvaultString(rawPic).trim() : '';
+          if (cId && cName) {
+            contactNameMap.set(cId, cName);
+            if (recordContactAlias(cId, cName, false)) {
+              added++;
+            }
+          }
+          if (cId && picUrl && /^https?:\/\//i.test(picUrl)) {
+            contactAvatarMap.set(cId, picUrl);
+            added++;
+          }
         }
       }
+
+      if (rawDb?.tables && typeof rawDb.tables === 'object') {
+        const participantTableNames = Object.keys(rawDb.tables).filter(
+          (k) => /participant/i.test(k) && rawDb.tables[k]
+        );
+        for (const pTableName of participantTableNames) {
+          try {
+            const pRows = await reqlMod.toArrayAsync(
+              reqlMod.fromTableAscending(rawDb.tables[pTableName])
+            );
+            if (!Array.isArray(pRows)) continue;
+            for (const pRow of pRows) {
+              if (!pRow || typeof pRow !== 'object') continue;
+              const rawCid =
+                pRow.contactId ?? pRow.contact_id ?? pRow.participantId ?? pRow.userId ?? pRow.id;
+              const cId =
+                parseLSInt64(rawCid) || (typeof rawCid === 'string' ? rawCid : '');
+              const rawTid = pRow.threadKey ?? pRow.thread_key ?? pRow.threadId ?? pRow.thread_id;
+              const tId =
+                parseLSInt64(rawTid) || (typeof rawTid === 'string' ? rawTid : '');
+              const rawNick =
+                pRow.nickname ??
+                pRow.customNickname ??
+                pRow.custom_nickname ??
+                pRow.participantNickname ??
+                '';
+              const nick = typeof rawNick === 'string' ? unvaultString(rawNick).trim() : '';
+              if (cId && nick) {
+                if (recordContactAlias(cId, nick, true, tId)) {
+                  added++;
+                }
+              }
+            }
+          } catch (_) {}
+        }
+      }
+
       if (added > 0) {
         scheduleEmitContactAvatars();
       }
@@ -903,14 +997,45 @@
     const cleanSenderId = senderId ? String(senderId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '') : '';
     const cleanThreadId = threadId ? String(threadId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '') : '';
 
+    if (cleanSenderId && explicitSenderName) {
+      recordContactAlias(cleanSenderId, explicitSenderName, false, cleanThreadId);
+    }
+
     const mappedContact = cleanSenderId ? contactNameMap.get(cleanSenderId) || '' : '';
+    const mappedNickname =
+      (cleanThreadId &&
+        cleanSenderId &&
+        contactNicknameMap.get(`${cleanThreadId}__${cleanSenderId}`)) ||
+      (cleanSenderId && contactNicknameMap.get(cleanSenderId)) ||
+      '';
+    const hasExplicitThreadMap = Boolean(cleanThreadId && threadNameMap.has(cleanThreadId));
     const mappedThread = cleanThreadId
-      ? threadNameMap.get(cleanThreadId) || contactNameMap.get(cleanThreadId) || ''
+      ? threadNameMap.get(cleanThreadId) ||
+        (cleanThreadId === cleanSenderId && mappedNickname ? mappedNickname : '') ||
+        contactNameMap.get(cleanThreadId) ||
+        ''
       : '';
 
-    const finalPersonName = explicitSenderName || mappedContact || '';
+    const finalPersonName = explicitSenderName || mappedNickname || mappedContact || '';
     const finalThreadName = explicitThreadName || mappedThread || '';
+    const isFallbackThreadName = Boolean(!explicitThreadName && !hasExplicitThreadMap && mappedThread);
     const avatarUrl = (cleanSenderId && contactAvatarMap.get(cleanSenderId)) || '';
+
+    const aliasSet = new Set();
+    const pushAlias = (val) => {
+      if (!val || typeof val !== 'string') return;
+      const trimmed = val.trim();
+      if (trimmed) aliasSet.add(trimmed);
+    };
+    pushAlias(explicitSenderName);
+    pushAlias(mappedNickname);
+    pushAlias(mappedContact);
+    if (cleanSenderId && contactAliasesMap.has(cleanSenderId)) {
+      for (const a of contactAliasesMap.get(cleanSenderId)) {
+        pushAlias(a);
+      }
+    }
+    const personAliases = Array.from(aliasSet);
 
     let combinedName = '';
     if (finalPersonName && finalThreadName) {
@@ -929,7 +1054,9 @@
     return {
       senderName: combinedName,
       personName: finalPersonName,
+      personAliases,
       threadName: finalThreadName,
+      isFallbackThreadName,
       avatarUrl
     };
   }
@@ -1201,6 +1328,10 @@
       nextEditHistory.length > prevHistory.length ||
       mergedAttachments.length > (existing.attachments?.length || 0);
 
+    const mergedPersonAliases = Array.from(
+      new Set([...(existing?.personAliases || []), ...(resolvedNames.personAliases || [])])
+    );
+
     const updatedRecord = {
       messageId,
       text: finalText,
@@ -1211,7 +1342,9 @@
       isSelf: typeof isSelf === 'boolean' ? isSelf : existing?.isSelf,
       senderName: resolvedNames.senderName || existing?.senderName || '',
       personName: resolvedNames.personName || existing?.personName || '',
+      personAliases: mergedPersonAliases,
       threadName: resolvedNames.threadName || existing?.threadName || '',
+      isFallbackThreadName: resolvedNames.isFallbackThreadName,
       avatarUrl: resolvedNames.avatarUrl || msgData.avatarUrl || existing?.avatarUrl || '',
       attachments: mergedAttachments,
       timestamp: existing?.timestamp || timestamp || Date.now(),
@@ -1227,6 +1360,7 @@
         messageId,
         text: finalText,
         personName: updatedRecord.personName,
+        personAliases: updatedRecord.personAliases,
         threadName: updatedRecord.threadName,
         source: updatedRecord.source
       });
@@ -1253,11 +1387,21 @@
     const finalThreadId = String(
       existing?.threadId || extraInfo.threadId || e2eeIds.threadId || ''
     ).replace(/@(msgr|g\.us|c\.us)$/i, '');
+    if (finalSenderId && noticeSenderName) {
+      recordContactAlias(finalSenderId, noticeSenderName, false, finalThreadId);
+    }
     const resolvedNames = resolveContactAndThreadName(
       finalSenderId,
       finalThreadId,
       extraInfo.senderName || noticeSenderName || existing?.personName || '',
       extraInfo.threadName || existing?.threadName || ''
+    );
+    const mergedPersonAliases = Array.from(
+      new Set([
+        ...(existing?.personAliases || []),
+        ...(resolvedNames.personAliases || []),
+        ...(noticeSenderName ? [noticeSenderName] : [])
+      ])
     );
 
     if (existing?.isUnsent) {
@@ -1285,7 +1429,9 @@
         threadId: finalThreadId,
         senderName: resolvedNames.senderName || '',
         personName: resolvedNames.personName || '',
+        personAliases: mergedPersonAliases,
         threadName: resolvedNames.threadName || '',
+        isFallbackThreadName: resolvedNames.isFallbackThreadName,
         avatarUrl: resolvedNames.avatarUrl || '',
         unsendNotice: extraInfo.unsendNotice || '',
         unsentAt: existing?.unsentAt || Date.now(),
@@ -1302,7 +1448,9 @@
       threadId: finalThreadId,
       senderName: resolvedNames.senderName || existing.senderName || '',
       personName: resolvedNames.personName || existing.personName || '',
+      personAliases: mergedPersonAliases,
       threadName: resolvedNames.threadName || existing.threadName || '',
+      isFallbackThreadName: resolvedNames.isFallbackThreadName,
       avatarUrl: resolvedNames.avatarUrl || existing.avatarUrl || '',
       unsendNotice: extraInfo.unsendNotice || existing.unsendNotice || '',
       unsentAt: existing.unsentAt || Date.now(),
@@ -1380,19 +1528,22 @@
       if (contactId && contactId !== '0') {
         let foundName = '';
         let foundAvatar = '';
+        let changed = false;
         for (let i = 1; i < Math.min(args.length, 12); i++) {
           if (typeof args[i] === 'string') {
             const candidate = unvaultString(args[i]).trim();
             if (!foundAvatar && /^https?:\/\//i.test(candidate)) {
               foundAvatar = candidate;
             } else if (
-              !foundName &&
               candidate.length >= 2 &&
               candidate.length <= 80 &&
               !candidate.startsWith('http') &&
               !isTechnicalString(candidate)
             ) {
-              foundName = candidate;
+              if (!foundName) foundName = candidate;
+              if (recordContactAlias(contactId, candidate, false)) {
+                changed = true;
+              }
             }
           }
         }
@@ -1401,6 +1552,52 @@
         }
         if (foundAvatar) {
           contactAvatarMap.set(contactId, foundAvatar);
+          changed = true;
+        }
+        if (changed) {
+          scheduleEmitContactAvatars();
+        }
+      }
+      return;
+    }
+
+    if (
+      /^(LSAddParticipantIdToGroupThread|LSUpdateParticipantNickname|LSUpsertParticipant|LSVerifyParticipantRowExists|LSUpdateOrInsertParticipant)(\.|$)/i.test(
+        moduleName
+      )
+    ) {
+      const ids = [];
+      const names = [];
+      for (let i = 0; i < Math.min(args.length, 16); i++) {
+        if (Array.isArray(args[i]) && args[i].length === 2) {
+          const idStr = parseLSInt64(args[i]);
+          const num = Number(idStr);
+          if (idStr && idStr.length >= 6 && idStr !== '0' && !(num > 1577836800000 && num < 2051222400000)) {
+            ids.push(idStr);
+          }
+        } else if (typeof args[i] === 'string') {
+          const candidate = unvaultString(args[i]).trim();
+          if (
+            candidate.length >= 1 &&
+            candidate.length <= 80 &&
+            !candidate.startsWith('http') &&
+            !isTechnicalString(candidate) &&
+            !isUnsendNoticeText(candidate)
+          ) {
+            names.push(candidate);
+          }
+        }
+      }
+      if (ids.length >= 1 && names.length >= 1) {
+        const threadId = ids.length >= 2 ? ids[0] : '';
+        const contactId = ids.length >= 2 ? ids[1] : ids[0];
+        let changed = false;
+        for (const n of names) {
+          if (recordContactAlias(contactId, n, true, threadId)) {
+            changed = true;
+          }
+        }
+        if (changed) {
           scheduleEmitContactAvatars();
         }
       }
@@ -1939,7 +2136,7 @@
   }
 
   const SAFE_TARGET_MODULE_REGEX =
-    /^(LS(UpsertMessage|DeleteThenInsertMessage|InsertMessage|ReplaceOptimisticMessage|.*Edit.*|.*MessageEditHistory.*|.*ReplaceMessage.*|.*Update.*Message.*|.*Overwrite.*Message.*|DeleteMessage|DeleteMessageRequest|MarkMessageUnsent|HandleUnsendMessage|InsertBlobAttachment|InsertAttachment|InsertXmaAttachment|InsertStickerAttachment|VerifyContactRowExists|UpdateOrInsertContact|UpsertContact|UpdateOrInsertThread|VerifyHybridThreadExists|UpsertThread)|MAW(UnvaultTransform|Vault|ThreadSnippetFor.*Msg|BridgeBuildThreadSnippet|BridgeBuildMsg|BridgeMsg|.*Edit.*|.*Update.*Msg.*|BridgeNewMsgHandler|BridgeNewMediaHandler)|Mps(RavenToBridge|MessageToBridge|MessageTextToBridge|.*Edit.*ToBridge.*|MediaToBridge|RevokeMessageToBridgeMsg|XmaToBridge|NoteReplyToBridge))$/i;
+    /^(LS(UpsertMessage|DeleteThenInsertMessage|InsertMessage|ReplaceOptimisticMessage|.*Edit.*|.*MessageEditHistory.*|.*ReplaceMessage.*|.*Update.*Message.*|.*Overwrite.*Message.*|DeleteMessage|DeleteMessageRequest|MarkMessageUnsent|HandleUnsendMessage|InsertBlobAttachment|InsertAttachment|InsertXmaAttachment|InsertStickerAttachment|VerifyContactRowExists|UpdateOrInsertContact|UpsertContact|AddParticipantIdToGroupThread|UpdateParticipantNickname|UpsertParticipant|VerifyParticipantRowExists|UpdateOrInsertParticipant|UpdateOrInsertThread|VerifyHybridThreadExists|UpsertThread)|MAW(UnvaultTransform|Vault|ThreadSnippetFor.*Msg|BridgeBuildThreadSnippet|BridgeBuildMsg|BridgeMsg|.*Edit.*|.*Update.*Msg.*|BridgeNewMsgHandler|BridgeNewMediaHandler)|Mps(RavenToBridge|MessageToBridge|MessageTextToBridge|.*Edit.*ToBridge.*|MediaToBridge|RevokeMessageToBridgeMsg|XmaToBridge|NoteReplyToBridge))$/i;
 
   const PASSIVE_EXPORT_CAPTURE_REGEX =
     /^(Mps(OverBridge|RavenToBridge|MediaToBridge|MessageToBridge|MessageTextToBridge|RevokeMessageToBridgeMsg|MessageToBridgeWrapper|MessageToLoadResponse|ToBridgeMessageId|Types|LoadMessagesStep|ReactionSupplementals)|MAW(Vault|UnvaultTransform|ProtobufDeserializers|AttachmentBlob\.react|GetAttachmentThumbnailBlob|DbMedia|MediaDownloadStatusBackendFetcher|DownloadMediaInWorker|DownloadMediaInWorkerDeferred|BridgeNewMsgHandler|BridgeNewMediaHandler|BridgeBuildMsg|BridgeSendAndReceive|MediaManagerUtils|MediaUtils)|WAMediaTransport\.pb|WAArmadilloApplication\.pb|WAConsumerApplication\.pb|WAHashUtils|WAByteArray|decodeProtobuf|LSDatabaseSingleton|ReQL)$/i;
@@ -2766,11 +2963,35 @@
         const cId = directI64Values[0];
         const cName = directTextLiterals[0];
         if (cId && cId !== '0' && cName.length >= 2 && cName.length <= 80) {
-          contactNameMap.set(cId, cName);
+          recordContactAlias(cId, cName, false);
           if (directMediaUrls.length > 0 && /^https?:\/\//i.test(directMediaUrls[0])) {
             contactAvatarMap.set(cId, directMediaUrls[0]);
-            scheduleEmitContactAvatars();
           }
+          scheduleEmitContactAvatars();
+        }
+      } else if (
+        /addParticipantIdToGroupThread|updateParticipantNickname|upsertParticipant|verifyParticipantRowExists|updateOrInsertParticipant/i.test(
+          currentFunc
+        ) &&
+        directI64Values.length > 0 &&
+        directTextLiterals.length > 0
+      ) {
+        const validIds = directI64Values.filter((v) => {
+          const n = Number(v);
+          return v.length >= 6 && v !== '0' && !(n > 1577836800000 && n < 2051222400000);
+        });
+        const tId = validIds[0] || '';
+        const cId = validIds[1] || validIds[0] || '';
+        const nick = directTextLiterals.find(
+          (lit) =>
+            lit &&
+            lit.length >= 2 &&
+            lit.length <= 80 &&
+            !/^(inbox|pending|other|archived|spam)$/i.test(lit)
+        );
+        if (cId && nick) {
+          recordContactAlias(cId, nick, true, tId);
+          scheduleEmitContactAvatars();
         }
       } else if (
         /updateOrInsertThread|verifyHybridThreadExists/i.test(currentFunc) &&

@@ -375,6 +375,129 @@
   const personAvatarByIdMap = new Map();
   const personAvatarByThreadAndNameMap = new Map();
   const personIdByThreadAndNameMap = new Map();
+  const personAliasesByIdMap = new Map();
+  const peerNameAliasSetMap = new Map();
+
+  function linkTwoPersonNamesAsAliases(nameA, nameB) {
+    const a = (nameA || '').trim().toLowerCase();
+    const b = (nameB || '').trim().toLowerCase();
+    if (!a || !b || a === b) return false;
+    if (a.length < 2 || b.length < 2) return false;
+    if (isGenericSenderName(a) || isGenericSenderName(b)) return false;
+    if (isSelfKeyword(a) || isSelfKeyword(b)) return false;
+    if (currentUserFullName) {
+      const selfLower = currentUserFullName.trim().toLowerCase();
+      if (a === selfLower || b === selfLower) return false;
+    }
+
+    let changed = false;
+    if (!peerNameAliasSetMap.has(a)) peerNameAliasSetMap.set(a, new Set());
+    if (!peerNameAliasSetMap.has(b)) peerNameAliasSetMap.set(b, new Set());
+    const setA = peerNameAliasSetMap.get(a);
+    const setB = peerNameAliasSetMap.get(b);
+    if (!setA.has(b)) {
+      setA.add(b);
+      changed = true;
+    }
+    if (!setB.has(a)) {
+      setB.add(a);
+      changed = true;
+    }
+    return changed;
+  }
+
+  function mergePersonAliasesList(...sources) {
+    const out = [];
+    const seenLower = new Set();
+    const addOne = (raw) => {
+      if (!raw || typeof raw !== 'string') return;
+      const trimmed = raw.trim();
+      if (!trimmed || trimmed.length < 1 || trimmed.length > 80) return;
+      if (isGenericSenderName(trimmed) || isSelfKeyword(trimmed)) return;
+      const lower = trimmed.toLowerCase();
+      if (seenLower.has(lower)) return;
+      seenLower.add(lower);
+      out.push(trimmed);
+    };
+    for (const src of sources) {
+      if (Array.isArray(src)) {
+        for (const item of src) addOne(item);
+      } else if (typeof src === 'string') {
+        addOne(src);
+      }
+    }
+    return out;
+  }
+
+  function registerPersonIdentityAliases(senderId = '', names = [], threadName = '') {
+    let changed = false;
+    const cleanId = senderId ? String(senderId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '') : '';
+    const validNames = mergePersonAliasesList(names);
+
+    for (let i = 0; i < validNames.length; i++) {
+      for (let j = i + 1; j < validNames.length; j++) {
+        if (linkTwoPersonNamesAsAliases(validNames[i], validNames[j])) {
+          changed = true;
+        }
+      }
+    }
+
+    if (cleanId && (!currentUserId || cleanId !== String(currentUserId))) {
+      if (!personAliasesByIdMap.has(cleanId)) {
+        personAliasesByIdMap.set(cleanId, new Set());
+      }
+      const idSet = personAliasesByIdMap.get(cleanId);
+      for (const n of validNames) {
+        const lower = n.toLowerCase();
+        if (!idSet.has(lower)) {
+          idSet.add(lower);
+          changed = true;
+        }
+        if (threadName) {
+          const scopedKey = buildScopedAvatarKey(threadName, n);
+          if (scopedKey && !personIdByThreadAndNameMap.has(scopedKey)) {
+            personIdByThreadAndNameMap.set(scopedKey, cleanId);
+          }
+        }
+      }
+      const allForId = Array.from(idSet);
+      if (allForId.length >= 2 && allForId.length <= 6) {
+        for (let i = 0; i < allForId.length; i++) {
+          for (let j = i + 1; j < allForId.length; j++) {
+            if (linkTwoPersonNamesAsAliases(allForId[i], allForId[j])) {
+              changed = true;
+            }
+          }
+        }
+      }
+    }
+    return changed;
+  }
+
+  function areNamesLinkedAliases(nameA, nameB, senderIdA = '', senderIdB = '') {
+    const cleanIdA = senderIdA ? String(senderIdA).trim().replace(/@(msgr|g\.us|c\.us)$/i, '') : '';
+    const cleanIdB = senderIdB ? String(senderIdB).trim().replace(/@(msgr|g\.us|c\.us)$/i, '') : '';
+    if (cleanIdA && cleanIdB) {
+      return cleanIdA === cleanIdB;
+    }
+    const a = (nameA || '').trim().toLowerCase();
+    const b = (nameB || '').trim().toLowerCase();
+    if (!a || !b) return false;
+    if (a === b) return true;
+    if (peerNameAliasSetMap.get(a)?.has(b) || peerNameAliasSetMap.get(b)?.has(a)) {
+      return true;
+    }
+    if (cleanIdA && personAliasesByIdMap.get(cleanIdA)?.has(b)) {
+      return true;
+    }
+    if (cleanIdB && personAliasesByIdMap.get(cleanIdB)?.has(a)) {
+      return true;
+    }
+    for (const set of personAliasesByIdMap.values()) {
+      if (set.has(a) && set.has(b)) return true;
+    }
+    return false;
+  }
 
   function buildScopedAvatarKey(threadName, personName) {
     const cleanPerson = (personName || '').trim().toLowerCase();
@@ -528,12 +651,15 @@
       }
     }
 
-    // 3. Nếu một senderId vẫn bị gắn cho nhiều personName khác nhau, chỉ giữ cho personName xuất hiện nhiều nhất
+    // 3. Liên kết biệt danh <-> tên thật cho cùng một senderId hợp lệ; chỉ xóa senderId nếu bị gán tràn cho > 3 tên rời rạc
     const senderIdNameCounts = new Map();
     for (const rec of allRecords) {
       const sId = String(rec.senderId || '').trim();
       const pName = String(rec.personName || '').trim().toLowerCase();
       if (!sId || !pName || rec.isSelf || isSelfKeyword(pName)) continue;
+      if (Array.isArray(rec.personAliases) && rec.personAliases.length > 0 && !groupThreadIds.has(sId)) {
+        registerPersonIdentityAliases(sId, [rec.personName, ...rec.personAliases], rec.threadName);
+      }
       if (!senderIdNameCounts.has(sId)) {
         senderIdNameCounts.set(sId, new Map());
       }
@@ -548,6 +674,9 @@
           validOwnerBySenderId.set(sId, name);
         }
         continue;
+      }
+      if (!groupThreadIds.has(sId) && counts.size <= 3) {
+        registerPersonIdentityAliases(sId, Array.from(counts.keys()));
       }
       let bestName = '';
       let bestCount = 0;
@@ -572,14 +701,20 @@
       );
       if (e2eeIds.senderId && e2eeIds.senderId === sId) continue;
       const owner = validOwnerBySenderId.get(sId);
-      if (owner && owner !== pName) {
+      const nameCountForSid = senderIdNameCounts.get(sId)?.size || 0;
+      if (
+        owner &&
+        owner !== pName &&
+        nameCountForSid > 3 &&
+        !areNamesLinkedAliases(owner, pName, sId)
+      ) {
         rec.senderId = '';
         corruptedRecordSet.add(rec);
         changed = true;
       }
     }
 
-    // 4. Làm sạch avatarUrl bị gán chéo giữa nhiều người khác tên (ví dụ avatar Nguyễn Minh Huy bị gán cho Duyên, Kiên, Vy, Bình)
+    // 4. Làm sạch avatarUrl bị gán chéo giữa nhiều người khác tên (bỏ qua nếu 2 tên là biệt danh <-> tên thật của cùng 1 người)
     const avatarNameCounts = new Map();
     for (const rec of allRecords) {
       const av = String(rec.avatarUrl || '').trim();
@@ -613,7 +748,12 @@
       const av = String(rec.avatarUrl || '').trim();
       const pName = String(rec.personName || '').trim().toLowerCase();
       if (!av) continue;
-      if (avatarTrueOwner.has(av) && avatarTrueOwner.get(av) !== pName) {
+      const trueOwner = avatarTrueOwner.get(av);
+      if (
+        trueOwner &&
+        trueOwner !== pName &&
+        !areNamesLinkedAliases(trueOwner, pName, rec.senderId)
+      ) {
         rec.avatarUrl = '';
         changed = true;
       }
@@ -621,12 +761,15 @@
 
     for (const gId of groupThreadIds) {
       personAvatarByIdMap.delete(gId);
+      personAliasesByIdMap.delete(gId);
       for (const [k, v] of personIdByThreadAndNameMap.entries()) {
         if (v === gId) personIdByThreadAndNameMap.delete(k);
       }
     }
     for (const [k, av] of personAvatarByThreadAndNameMap.entries()) {
-      if (avatarTrueOwner.has(av) && !k.endsWith(`__${avatarTrueOwner.get(av)}`)) {
+      const trueOwner = avatarTrueOwner.get(av);
+      const keyPerson = k.split('__').pop() || '';
+      if (trueOwner && !k.endsWith(`__${trueOwner}`) && !areNamesLinkedAliases(trueOwner, keyPerson)) {
         personAvatarByThreadAndNameMap.delete(k);
       }
     }
@@ -652,16 +795,26 @@
         item.senderId = e2eeIds.senderId;
         changed = true;
       }
+      if (!item.isSelf) {
+        registerPersonIdentityAliases(
+          item.senderId,
+          [item.personName, ...(item.personAliases || [])],
+          item.threadName
+        );
+      }
       if (!item.isSelf && item.senderId && item.personName) {
-        const key = buildScopedAvatarKey(item.threadName || item.personName, item.personName);
-        if (key) {
-          knownSenderIdByScopedKey.set(key, String(item.senderId));
-          personIdByThreadAndNameMap.set(key, String(item.senderId));
-        }
-        if (item.avatarUrl && /^https?:\/\//i.test(item.avatarUrl)) {
-          personAvatarByIdMap.set(String(item.senderId), item.avatarUrl.trim());
+        const allNames = mergePersonAliasesList(item.personName, item.personAliases);
+        for (const n of allNames) {
+          const key = buildScopedAvatarKey(item.threadName || n, n);
           if (key) {
-            personAvatarByThreadAndNameMap.set(key, item.avatarUrl.trim());
+            knownSenderIdByScopedKey.set(key, String(item.senderId));
+            personIdByThreadAndNameMap.set(key, String(item.senderId));
+          }
+          if (item.avatarUrl && /^https?:\/\//i.test(item.avatarUrl)) {
+            personAvatarByIdMap.set(String(item.senderId), item.avatarUrl.trim());
+            if (key) {
+              personAvatarByThreadAndNameMap.set(key, item.avatarUrl.trim());
+            }
           }
         }
       }
@@ -1006,6 +1159,12 @@
     );
     const finalSenderId = base.senderId || e2eeIds.senderId || '';
     const finalThreadId = base.threadId || e2eeIds.threadId || '';
+    const cleanPersonAliases = inferredSelf
+      ? []
+      : mergePersonAliasesList(base.personAliases, cleanPerson, base.personName);
+    if (!inferredSelf && cleanPersonAliases.length > 0) {
+      registerPersonIdentityAliases(finalSenderId, cleanPersonAliases, cleanThread);
+    }
     const resolvedAvatar = resolveAvatarForPerson(
       cleanPerson || base.personName || '',
       finalSenderId,
@@ -1021,6 +1180,7 @@
       senderId: finalSenderId,
       threadId: finalThreadId,
       personName: cleanPerson || base.personName || '',
+      personAliases: cleanPersonAliases,
       threadName: cleanThread,
       senderName: finalSender,
       avatarUrl: resolvedAvatar || base.avatarUrl || '',
@@ -1585,6 +1745,13 @@
           }
         }
       }
+      if (payload.aliasesById && typeof payload.aliasesById === 'object') {
+        for (const [id, aliasList] of Object.entries(payload.aliasesById)) {
+          if (id && Array.isArray(aliasList)) {
+            registerPersonIdentityAliases(id, aliasList);
+          }
+        }
+      }
       backfillAvatarsInStoredLists();
     } else if (type === 'FB_E2EE_REVOKE_RESOLVED') {
       handleE2EERevokeResolved(payload);
@@ -1671,7 +1838,23 @@
     return cleaned;
   }
 
-  function isSameThreadName(threadA, threadB, senderNameB = '', requireBoth = false) {
+  function isSameThreadName(
+    threadA,
+    threadB,
+    senderNameB = '',
+    requireBoth = false,
+    threadIdA = '',
+    threadIdB = ''
+  ) {
+    const cleanTidA = threadIdA
+      ? String(threadIdA).trim().replace(/@(msgr|g\.us|c\.us)$/i, '')
+      : '';
+    const cleanTidB = threadIdB
+      ? String(threadIdB).trim().replace(/@(msgr|g\.us|c\.us)$/i, '')
+      : '';
+    if (cleanTidA && cleanTidB) {
+      return cleanTidA === cleanTidB;
+    }
     const a = normalizeThreadTitle(threadA).toLowerCase();
     let b = normalizeThreadTitle(threadB).toLowerCase();
     if (!b && senderNameB && String(senderNameB).includes('•')) {
@@ -1686,6 +1869,9 @@
     if (!a || !b) return !requireBoth;
     if (a === b) return true;
     if (a.length >= 3 && b.length >= 3 && (a.includes(b) || b.includes(a))) {
+      return true;
+    }
+    if (areNamesLinkedAliases(a, b, cleanTidA, cleanTidB)) {
       return true;
     }
     return false;
@@ -1828,9 +2014,13 @@
       '';
 
     const bestThread =
+      (!msg.isFallbackThreadName && !isGenericSenderName(msg.threadName) && msg.threadName) ||
+      (!isGenericSenderName(activeThread) && activeThread) ||
+      (!existing?.isFallbackThreadName &&
+        !isGenericSenderName(existing?.threadName) &&
+        existing?.threadName) ||
       (!isGenericSenderName(msg.threadName) && msg.threadName) ||
-      (!isGenericSenderName(existing?.threadName) && existing?.threadName) ||
-      (!isGenericSenderName(activeThread) ? activeThread : '');
+      (!isGenericSenderName(existing?.threadName) ? existing?.threadName : '');
 
     const resolvedSenderName = formatSenderAndThreadName(
       resolvedPerson,
@@ -1866,6 +2056,22 @@
     const e2eeIds = extractPeerIdFromE2EEMsgId(bestId, finalIsSelf);
     const resolvedSenderId = msg.senderId || existing?.senderId || e2eeIds.senderId || '';
     const resolvedThreadId = msg.threadId || existing?.threadId || e2eeIds.threadId || '';
+    const isOneOnOneThread = Boolean(
+      resolvedSenderId && resolvedThreadId && String(resolvedSenderId) === String(resolvedThreadId)
+    );
+    const mergedPersonAliases = finalIsSelf
+      ? []
+      : mergePersonAliasesList(
+          msg.personAliases,
+          existing?.personAliases,
+          msg.personName,
+          existing?.personName,
+          resolvedPerson,
+          isOneOnOneThread ? [bestThread, msg.threadName, existing?.threadName] : []
+        );
+    if (!finalIsSelf && mergedPersonAliases.length > 0) {
+      registerPersonIdentityAliases(resolvedSenderId, mergedPersonAliases, bestThread);
+    }
     const resolvedAvatar = resolveAvatarForPerson(
       resolvedPerson,
       resolvedSenderId,
@@ -1889,6 +2095,7 @@
         : msg.lastEditAt || existing?.lastEditAt || 0,
       attachments: combinedAttachments,
       personName: resolvedPerson,
+      personAliases: mergedPersonAliases,
       threadName: bestThread,
       senderName: resolvedSenderName,
       avatarUrl: resolvedAvatar,
@@ -2071,6 +2278,25 @@
         newRecord.senderId || existingItem.senderId || e2eeIds.senderId || '';
       const resolvedThreadId =
         newRecord.threadId || existingItem.threadId || e2eeIds.threadId || '';
+      const mergedPersonAliases = mergePersonAliasesList(
+        existingItem.personAliases,
+        newRecord.personAliases,
+        existingItem.personName,
+        newRecord.personName,
+        bestPerson
+      );
+      if (!recIsSelf) {
+        registerPersonIdentityAliases(
+          resolvedSenderId,
+          mergedPersonAliases,
+          resolvedThreadId,
+          resolvedSenderId &&
+            resolvedThreadId &&
+            String(resolvedSenderId) === String(resolvedThreadId)
+            ? bestThread
+            : ''
+        );
+      }
       const resolvedAvatar = resolveAvatarForPerson(
         bestPerson,
         resolvedSenderId,
@@ -2090,6 +2316,7 @@
         editHistory: mergedEditHistory,
         attachments: mergedAttachments,
         personName: bestPerson,
+        personAliases: mergedPersonAliases,
         threadName: bestThread,
         senderName: resolvedSenderName,
         avatarUrl: resolvedAvatar,
@@ -2139,6 +2366,20 @@
     );
     const finalSenderId = newRecord.senderId || newE2eeIds.senderId || '';
     const finalThreadId = newRecord.threadId || newE2eeIds.threadId || '';
+    const finalPersonAliases = mergePersonAliasesList(
+      newRecord.personAliases,
+      newRecord.personName
+    );
+    if (!recIsSelf) {
+      registerPersonIdentityAliases(
+        finalSenderId,
+        finalPersonAliases,
+        finalThreadId,
+        finalSenderId && finalThreadId && String(finalSenderId) === String(finalThreadId)
+          ? newRecord.threadName
+          : ''
+      );
+    }
     const finalAvatar = resolveAvatarForPerson(
       newRecord.personName,
       finalSenderId,
@@ -2158,6 +2399,7 @@
       isSelf: recIsSelf,
       senderId: finalSenderId,
       threadId: finalThreadId,
+      personAliases: finalPersonAliases,
       avatarUrl: finalAvatar,
       attachments: cleanAttachments,
       timestamp: newRecord.timestamp || getMonotonicTimestamp(),
@@ -2313,6 +2555,27 @@
       ...(unsentData.attachments || [])
     ]);
 
+    const noticePerson = extractNameFromNotice(unsentData.unsendNotice);
+    const earlySenderId = existing?.senderId || unsentData.senderId || '';
+    const earlyThreadId = existing?.threadId || unsentData.threadId || '';
+    const earlyAliases = mergePersonAliasesList(
+      existing?.personAliases,
+      unsentData.personAliases,
+      unsentData.personName,
+      existing?.personName,
+      noticePerson
+    );
+    if (earlyAliases.length > 0 && expectedIsSelf !== true) {
+      registerPersonIdentityAliases(
+        earlySenderId,
+        earlyAliases,
+        earlyThreadId,
+        earlySenderId && earlyThreadId && String(earlySenderId) === String(earlyThreadId)
+          ? existing?.threadName || unsentData.threadName || ''
+          : ''
+      );
+    }
+
     if (!originalText && originalAttachments.length === 0) {
       dlog('UNSENT-EVENT-NO-TEXT-YET', '#fbc531', 'Sự kiện gỡ chưa tìm thấy nội dung theo ID, kích hoạt quét Fiber + DOM:', {
         messageId: unsentData.messageId,
@@ -2327,7 +2590,6 @@
       return;
     }
 
-    const noticePerson = extractNameFromNotice(unsentData.unsendNotice);
     const isSelf =
       typeof existing?.isSelf === 'boolean'
         ? existing.isSelf
@@ -2352,6 +2614,9 @@
       noticePerson ||
       '';
     const bestThread =
+      (unsentData.isFallbackThreadName &&
+        !isGenericSenderName(existing?.threadName) &&
+        existing?.threadName) ||
       (!isGenericSenderName(unsentData.threadName) && unsentData.threadName) ||
       (!isGenericSenderName(existing?.threadName) && existing?.threadName) ||
       '';
@@ -2362,15 +2627,18 @@
       unsentData.senderName || existing?.senderName || ''
     );
 
+    const candidateAliases = mergePersonAliasesList(earlyAliases, bestPerson);
+
     const candidateRecord = {
       messageId: unsentData.messageId,
       isSelf,
       text: originalText,
       editHistory: mergedEditHistory,
       attachments: originalAttachments,
-      senderId: existing?.senderId || unsentData.senderId || '',
-      threadId: existing?.threadId || unsentData.threadId || '',
+      senderId: earlySenderId,
+      threadId: earlyThreadId,
       personName: bestPerson,
+      personAliases: candidateAliases,
       threadName: bestThread,
       senderName: resolvedSenderName,
       anchorAboveText: existing?.anchorAboveText || '',
@@ -2629,15 +2897,21 @@
     return 'Facebook Chat';
   }
 
-  function extractSenderFromChatRow(rowEl) {
-    if (!rowEl || !(rowEl instanceof HTMLElement)) return '';
+  function extractSenderDetailsFromChatRow(rowEl) {
+    if (!rowEl || !(rowEl instanceof HTMLElement)) {
+      return { primarySender: '', headerSender: '', avatarAltSender: '' };
+    }
 
+    let headerSender = '';
     const senderHeaders = rowEl.querySelectorAll('h4, h5, h6');
     for (const h of senderHeaders) {
       if (h.closest('.fb-unsend-community-restored-list')) continue;
       const raw = (h.innerText || h.textContent || '').trim().split('\n')[0];
       if (!raw) continue;
-      if (/^(Bạn đã gửi|You sent)$/i.test(raw)) return 'Bạn';
+      if (/^(Bạn đã gửi|You sent)$/i.test(raw)) {
+        headerSender = 'Bạn';
+        break;
+      }
       if (
         raw.length >= 2 &&
         raw.length <= 60 &&
@@ -2645,10 +2919,12 @@
         !UNSEND_REGEX.test(raw) &&
         !UI_IGNORE_REGEX.test(raw)
       ) {
-        return raw;
+        headerSender = raw;
+        break;
       }
     }
 
+    let avatarAltSender = '';
     const rowRect = rowEl.getBoundingClientRect();
     const imgs = rowEl.querySelectorAll('img[alt]');
     for (const img of imgs) {
@@ -2664,15 +2940,34 @@
         continue;
       }
       const rect = img.getBoundingClientRect();
-      const w = rect.width || img.clientWidth || img.width || 0;
+      const attrW = parseFloat(img.getAttribute('width') || '0') || 0;
+      const w = rect.width || img.clientWidth || attrW || 0;
       const isLeftAvatar =
-        rowRect.width === 0 || rect.left <= rowRect.left + rowRect.width * 0.45;
-      if ((w === 0 || w <= 52) && isLeftAvatar) {
-        return alt;
+        rowRect.width === 0 || rect.left <= rowRect.left + Math.min(90, rowRect.width * 0.35);
+      if ((w === 0 || (w >= 20 && w <= 52)) && isLeftAvatar) {
+        avatarAltSender = alt;
+        break;
       }
     }
 
-    return '';
+    if (
+      headerSender &&
+      avatarAltSender &&
+      !isSelfKeyword(headerSender) &&
+      !isSelfKeyword(avatarAltSender)
+    ) {
+      linkTwoPersonNamesAsAliases(headerSender, avatarAltSender);
+    }
+
+    return {
+      primarySender: headerSender || avatarAltSender || '',
+      headerSender,
+      avatarAltSender
+    };
+  }
+
+  function extractSenderFromChatRow(rowEl) {
+    return extractSenderDetailsFromChatRow(rowEl).primarySender;
   }
 
   function detectRowIsSelf(rowEl, rowSenderName = '', noticeEl = null) {
@@ -2893,13 +3188,18 @@
         text: '',
         attachments: [],
         rowSenderName: '',
+        rowHeaderSender: '',
+        rowAvatarAltSender: '',
         rowAvatarUrl: '',
         isSelf: false
       };
     }
 
-    const rowSenderName = extractSenderFromChatRow(rowEl);
-    const rowAvatarUrl = extractAvatarFromChatRow(rowEl, rowSenderName);
+    const senderDetails = extractSenderDetailsFromChatRow(rowEl);
+    const rowSenderName = senderDetails.primarySender;
+    const rowHeaderSender = senderDetails.headerSender;
+    const rowAvatarAltSender = senderDetails.avatarAltSender;
+    const rowAvatarUrl = extractAvatarFromChatRow(rowEl, rowSenderName || rowAvatarAltSender);
 
     const hasRestoredDomNodes = Array.from(
       rowEl.querySelectorAll(
@@ -2952,6 +3252,9 @@
           text: '',
           attachments: [],
           rowSenderName,
+          rowHeaderSender,
+          rowAvatarAltSender,
+          rowAvatarUrl,
           isSelf: detectRowIsSelf(rowEl, rowSenderName, null)
         };
       }
@@ -3014,6 +3317,8 @@
         text: '',
         attachments: [],
         rowSenderName,
+        rowHeaderSender,
+        rowAvatarAltSender,
         rowAvatarUrl,
         isSelf: detectRowIsSelf(rowEl, rowSenderName, unsentNoticeEl)
       };
@@ -3354,17 +3659,40 @@
       editHistory: resolvedRowEditHistory,
       attachments: sanitizeAttachmentsList(attachments),
       rowSenderName,
+      rowHeaderSender,
+      rowAvatarAltSender,
       rowAvatarUrl,
       isSelf: detectRowIsSelf(rowEl, rowSenderName, unsupportedCardEl)
     };
   }
 
-  function isSamePersonName(nameA, nameB, allowSelfAlias = false) {
+  function isSamePersonName(
+    nameA,
+    nameB,
+    allowSelfAlias = false,
+    senderIdA = '',
+    senderIdB = '',
+    aliasesA = null,
+    aliasesB = null
+  ) {
+    const cleanIdA = senderIdA
+      ? String(senderIdA).trim().replace(/@(msgr|g\.us|c\.us)$/i, '')
+      : '';
+    const cleanIdB = senderIdB
+      ? String(senderIdB).trim().replace(/@(msgr|g\.us|c\.us)$/i, '')
+      : '';
+    if (cleanIdA && cleanIdB && cleanIdA !== '0' && cleanIdA === cleanIdB) {
+      return true;
+    }
+
     const a = (nameA || '').trim().toLowerCase();
     const b = (nameB || '').trim().toLowerCase();
     if (!a || !b) return false;
     if (a === b) return true;
     if (allowSelfAlias && isCurrentUserName(a) && isCurrentUserName(b)) {
+      return true;
+    }
+    if (areNamesLinkedAliases(a, b, cleanIdA, cleanIdB, aliasesA, aliasesB)) {
       return true;
     }
     if (a.length >= 2 && b.length >= 2 && !isSelfKeyword(a) && !isSelfKeyword(b)) {
@@ -3514,16 +3842,41 @@
             rowIsSelf,
             noticePerson,
             threadName: item.threadName || '',
+            threadId: item.threadId || '',
+            senderId: item.senderId || '',
+            personAliases: item.personAliases || [],
             anchorAboveText: (item.anchorAboveText || '').trim(),
             rows: []
           });
+        } else {
+          const g = groups.get(groupKey);
+          if (!g.threadId && item.threadId) g.threadId = item.threadId;
+          if (!g.senderId && item.senderId) g.senderId = item.senderId;
+          g.personAliases = mergePersonAliasesList(g.personAliases, item.personAliases);
         }
         groups.get(groupKey).rows.push(item);
       }
 
       for (const group of groups.values()) {
-        const { rowIsSelf, noticePerson, threadName, anchorAboveText, rows } = group;
+        const {
+          rowIsSelf,
+          noticePerson,
+          threadName,
+          threadId: groupThreadId,
+          senderId: groupSenderId,
+          personAliases: groupAliases,
+          anchorAboveText,
+          rows
+        } = group;
         const pLower = noticePerson.toLowerCase();
+        const cleanThread = normalizeThreadTitle(threadName);
+        const isOneToOneGroupContext = Boolean(
+          !rowIsSelf &&
+            ((noticePerson &&
+              cleanThread &&
+              isSamePersonName(noticePerson, cleanThread, false)) ||
+              (groupThreadId && groupSenderId && String(groupThreadId) === String(groupSenderId)))
+        );
         const maxRowFirstSeen = Math.max(
           ...rows.map((r) => Number(r.rowEl.dataset?.fbUnsendFirstSeenAt) || Date.now())
         );
@@ -3539,7 +3892,34 @@
           const uIsSelf = inferRecordIsSelf(u);
           if (uIsSelf !== rowIsSelf) return false;
 
-          if (!isSameThreadName(threadName, u.threadName, u.senderName)) {
+          const uIsOneToOne = Boolean(
+            !uIsSelf &&
+              ((u.senderId && u.threadId && String(u.senderId) === String(u.threadId)) ||
+                (u.personName &&
+                  u.threadName &&
+                  normalizePersonKey(u.personName) === normalizePersonKey(u.threadName)))
+          );
+          const sameThread =
+            isSameThreadName(
+              threadName,
+              u.threadName,
+              u.senderName,
+              false,
+              groupThreadId,
+              u.threadId
+            ) ||
+            (isOneToOneGroupContext &&
+              uIsOneToOne &&
+              isSamePersonName(
+                noticePerson || cleanThread,
+                u.personName || u.threadName,
+                false,
+                groupSenderId || groupThreadId,
+                u.senderId || u.threadId,
+                groupAliases,
+                u.personAliases
+              ));
+          if (!sameThread) {
             return false;
           }
 
@@ -3565,10 +3945,44 @@
           const uSenderParts = (u.senderName || '').split('•').map((s) => s.trim());
           const uSenderPerson = uSenderParts[0] || '';
 
-          return (
-            isSamePersonName(noticePerson, uPerson, false) ||
-            isSamePersonName(noticePerson, uSenderPerson, false)
-          );
+          if (
+            isSamePersonName(
+              noticePerson,
+              uPerson,
+              false,
+              groupSenderId,
+              u.senderId,
+              groupAliases,
+              u.personAliases
+            ) ||
+            isSamePersonName(
+              noticePerson,
+              uSenderPerson,
+              false,
+              groupSenderId,
+              u.senderId,
+              groupAliases,
+              u.personAliases
+            )
+          ) {
+            return true;
+          }
+
+          if (
+            isOneToOneGroupContext &&
+            isSameThreadName(
+              threadName,
+              u.threadName,
+              u.senderName,
+              true,
+              groupThreadId,
+              u.threadId
+            )
+          ) {
+            return true;
+          }
+
+          return false;
         });
 
         if (candidates.length === 0) continue;
@@ -3689,7 +4103,9 @@
     const currentActiveIds = new Set();
     const currentUnsentRows = [];
     const lastOtherSenderByContainer = new Map();
+    const activeClusterHeaderSenderByContainer = new Map();
     const lastNormalRowInfoByContainer = new Map();
+    const containerThreadIdMap = new Map();
 
     chatRows.forEach((rowEl, index) => {
       const container = getChatContainerForRow(rowEl);
@@ -3701,8 +4117,24 @@
         : '';
       const noticePerson = extractNameFromNotice(noticeText);
 
-      if (!analysis.isSelf) {
+      if (analysis.isSelf) {
+        activeClusterHeaderSenderByContainer.delete(container);
+      } else {
+        if (analysis.rowHeaderSender && !isSelfKeyword(analysis.rowHeaderSender)) {
+          activeClusterHeaderSenderByContainer.set(container, analysis.rowHeaderSender);
+          if (analysis.rowAvatarAltSender && !isSelfKeyword(analysis.rowAvatarAltSender)) {
+            linkTwoPersonNamesAsAliases(analysis.rowHeaderSender, analysis.rowAvatarAltSender);
+          }
+        } else if (analysis.rowAvatarAltSender && !isSelfKeyword(analysis.rowAvatarAltSender)) {
+          const clusterHeader = activeClusterHeaderSenderByContainer.get(container) || '';
+          if (clusterHeader && !isSelfKeyword(clusterHeader)) {
+            linkTwoPersonNamesAsAliases(clusterHeader, analysis.rowAvatarAltSender);
+          }
+        }
         const knownOtherName =
+          (!isSelfKeyword(analysis.rowHeaderSender) && analysis.rowHeaderSender) ||
+          (!isSelfKeyword(activeClusterHeaderSenderByContainer.get(container)) &&
+            activeClusterHeaderSenderByContainer.get(container)) ||
           (!isSelfKeyword(analysis.rowSenderName) && analysis.rowSenderName) ||
           (!isSelfKeyword(noticePerson) && noticePerson) ||
           '';
@@ -3725,6 +4157,42 @@
       if (analysis.isUnsentRow) {
         const unsentFiberId = getRowMessageId(rowEl);
         const unsentE2eeIds = extractPeerIdFromE2EEMsgId(unsentFiberId, analysis.isSelf);
+        const unsentMemRec = domRowMessages.get(rowEl);
+        const unsentNetRec = unsentFiberId ? messagesById.get(unsentFiberId) : null;
+        const unsentSenderId =
+          unsentNetRec?.senderId || unsentMemRec?.senderId || unsentE2eeIds.senderId || '';
+        const unsentThreadId =
+          unsentNetRec?.threadId ||
+          unsentMemRec?.threadId ||
+          unsentE2eeIds.threadId ||
+          containerThreadIdMap.get(container) ||
+          '';
+        if (unsentThreadId && !containerThreadIdMap.has(container)) {
+          containerThreadIdMap.set(container, unsentThreadId);
+        }
+        const unsentRowAliases = mergePersonAliasesList(
+          unsentNetRec?.personAliases,
+          unsentMemRec?.personAliases,
+          noticePerson,
+          analysis.rowHeaderSender,
+          analysis.rowAvatarAltSender,
+          analysis.rowSenderName,
+          rowEl.dataset?.fbUnsendSavedSender,
+          unsentNetRec?.personName,
+          unsentMemRec?.personName
+        );
+        if (!analysis.isSelf && unsentRowAliases.length > 0) {
+          registerPersonIdentityAliases(
+            unsentSenderId,
+            unsentRowAliases,
+            unsentThreadId,
+            unsentSenderId &&
+              unsentThreadId &&
+              String(unsentSenderId) === String(unsentThreadId)
+              ? threadName
+              : ''
+          );
+        }
         if (
           !analysis.isSelf &&
           (noticePerson || analysis.rowSenderName || inheritedOtherSender || threadName)
@@ -3741,7 +4209,7 @@
                 threadName,
                 avPerson,
                 analysis.rowAvatarUrl,
-                unsentE2eeIds.senderId
+                unsentSenderId
               )
             ) {
               backfillAvatarsInStoredLists();
@@ -3767,6 +4235,9 @@
             noticeEl: analysis.unsentNoticeEl,
             rowIndex: index,
             threadName,
+            threadId: unsentThreadId,
+            senderId: unsentSenderId,
+            personAliases: unsentRowAliases,
             chatContainer: container,
             anchorAboveText,
             anchorAboveSender,
@@ -3794,7 +4265,15 @@
             if (
               analysis.rowSenderName &&
               oldRec.personName &&
-              !isSamePersonName(analysis.rowSenderName, oldRec.personName, analysis.isSelf)
+              !isSamePersonName(
+                analysis.rowSenderName,
+                oldRec.personName,
+                analysis.isSelf,
+                '',
+                oldRec.senderId,
+                [analysis.rowHeaderSender, analysis.rowAvatarAltSender],
+                oldRec.personAliases
+              )
             ) {
               continue;
             }
@@ -3821,13 +4300,30 @@
           !areAuthoritativeIdsCompatible(fiberMsgId, prev.fiberMsgId, false);
         const hasConflictingThread =
           Boolean(prev?.threadName && threadName) &&
-          !isSameThreadName(prev.threadName, threadName);
+          !isSameThreadName(
+            prev.threadName,
+            threadName,
+            prev.senderName,
+            false,
+            prev.threadId,
+            containerThreadIdMap.get(container) || ''
+          );
         const hasConflictingSender =
           (typeof prev?.isSelf === 'boolean' && prev.isSelf !== analysis.isSelf) ||
           Boolean(
-            analysis.rowSenderName &&
+            !hasConflictingFiberId &&
+              !fiberMsgId &&
+              analysis.rowSenderName &&
               prev?.personName &&
-              !isSamePersonName(analysis.rowSenderName, prev.personName, analysis.isSelf)
+              !isSamePersonName(
+                analysis.rowSenderName,
+                prev.personName,
+                analysis.isSelf,
+                '',
+                prev.senderId,
+                [analysis.rowHeaderSender, analysis.rowAvatarAltSender],
+                prev.personAliases
+              )
           );
 
         const isRecycledNode = Boolean(
@@ -3862,9 +4358,24 @@
         }
 
         const existingById = messagesById.get(msgId);
+        const e2eePeerIds = extractPeerIdFromE2EEMsgId(msgId, analysis.isSelf);
+        const resolvedSenderId =
+          existingById?.senderId || safePrev?.senderId || e2eePeerIds.senderId || '';
+        const resolvedThreadId =
+          existingById?.threadId ||
+          safePrev?.threadId ||
+          e2eePeerIds.threadId ||
+          containerThreadIdMap.get(container) ||
+          '';
+        if (resolvedThreadId) {
+          containerThreadIdMap.set(container, resolvedThreadId);
+        }
+
         const personName = analysis.isSelf
           ? currentUserFullName || 'Bạn'
           : chooseBestPersonName(
+              analysis.rowHeaderSender,
+              activeClusterHeaderSenderByContainer.get(container),
               analysis.rowSenderName,
               existingById?.personName,
               safePrev?.personName,
@@ -3872,9 +4383,34 @@
               inheritedOtherSender
             );
 
-        const e2eePeerIds = extractPeerIdFromE2EEMsgId(msgId, analysis.isSelf);
+        const rowPersonAliases = analysis.isSelf
+          ? []
+          : mergePersonAliasesList(
+              existingById?.personAliases,
+              safePrev?.personAliases,
+              analysis.rowHeaderSender,
+              analysis.rowAvatarAltSender,
+              analysis.rowSenderName,
+              existingById?.personName,
+              safePrev?.personName,
+              rowEl.dataset?.fbUnsendSavedSender,
+              personName
+            );
+        if (!analysis.isSelf && rowPersonAliases.length > 0) {
+          registerPersonIdentityAliases(
+            resolvedSenderId,
+            rowPersonAliases,
+            resolvedThreadId,
+            resolvedSenderId &&
+              resolvedThreadId &&
+              String(resolvedSenderId) === String(resolvedThreadId)
+              ? threadName
+              : ''
+          );
+        }
+
         const hasAuthoritativeRowPerson = Boolean(
-          analysis.rowSenderName || existingById?.personName || e2eePeerIds.senderId
+          analysis.rowSenderName || existingById?.personName || resolvedSenderId
         );
         if (
           hasAuthoritativeRowPerson &&
@@ -3887,7 +4423,7 @@
               threadName,
               personName,
               analysis.rowAvatarUrl,
-              e2eePeerIds.senderId
+              resolvedSenderId
             )
           ) {
             backfillAvatarsInStoredLists();
@@ -3912,10 +4448,6 @@
           analysis.attachments.length > 0 ? analysis.attachments : safePrev?.attachments || []
         );
 
-        const resolvedSenderId =
-          existingById?.senderId || safePrev?.senderId || e2eePeerIds.senderId || '';
-        const resolvedThreadId =
-          existingById?.threadId || safePrev?.threadId || e2eePeerIds.threadId || '';
         const resolvedAvatarUrl = resolveAvatarForPerson(
           personName,
           resolvedSenderId,
@@ -3973,6 +4505,7 @@
             : safePrev?.lastEditAt || existingById?.lastEditAt || 0,
           attachments: cleanAttachments,
           personName,
+          personAliases: rowPersonAliases,
           threadName: !isGenericSenderName(threadName) ? threadName : safePrev?.threadName || '',
           senderName: fullSenderName,
           avatarUrl: resolvedAvatarUrl,
@@ -4110,6 +4643,9 @@
         noticeEl,
         rowIndex,
         threadName,
+        threadId: rowThreadId,
+        senderId: rowSenderId,
+        personAliases: rowAliases,
         chatContainer,
         anchorAboveText,
         isSelf,
@@ -4122,6 +4658,14 @@
         const fiberId = getRowMessageId(rowEl);
         const firstSeenAt = Number(rowEl.dataset?.fbUnsendFirstSeenAt) || Date.now();
         const isNewlyUnsentRow = Date.now() - firstSeenAt <= 6000;
+        const cleanThread = normalizeThreadTitle(threadName);
+        const isOneToOneRowContext = Boolean(
+          !isSelf &&
+            ((noticePerson &&
+              cleanThread &&
+              isSamePersonName(noticePerson, cleanThread, false)) ||
+              (rowThreadId && rowSenderId && String(rowThreadId) === String(rowSenderId)))
+        );
 
         const isRecordValidForThisRow = (
           cand,
@@ -4157,11 +4701,67 @@
           if (candIsSelf !== Boolean(isSelf)) {
             return false;
           }
-          if (!isSameThreadName(threadName, cand.threadName, cand.senderName)) {
+          const candIsOneToOne = Boolean(
+            !candIsSelf &&
+              ((cand.senderId && cand.threadId && String(cand.senderId) === String(cand.threadId)) ||
+                (cand.personName &&
+                  cand.threadName &&
+                  normalizePersonKey(cand.personName) === normalizePersonKey(cand.threadName)))
+          );
+          const threadMatches =
+            isSameThreadName(
+              threadName,
+              cand.threadName,
+              cand.senderName,
+              false,
+              rowThreadId,
+              cand.threadId
+            ) ||
+            (isOneToOneRowContext &&
+              candIsOneToOne &&
+              (cand === specificRecord ||
+                isSamePersonName(
+                  noticePerson || cleanThread,
+                  cand.personName || cand.threadName,
+                  false,
+                  rowSenderId || rowThreadId,
+                  cand.senderId || cand.threadId,
+                  rowAliases,
+                  cand.personAliases
+                )));
+          if (!threadMatches) {
             return false;
           }
           if (requireNameMatch && !isSelf && noticePerson && cand.personName) {
-            return isSamePersonName(noticePerson, cand.personName, false);
+            if (
+              isSamePersonName(
+                noticePerson,
+                cand.personName,
+                false,
+                rowSenderId,
+                cand.senderId,
+                rowAliases,
+                cand.personAliases
+              )
+            ) {
+              return true;
+            }
+            if (
+              isOneToOneRowContext &&
+              (cand === specificRecord ||
+                cand.chatContainer === chatContainer ||
+                isSameThreadName(
+                  threadName,
+                  cand.threadName,
+                  cand.senderName,
+                  true,
+                  rowThreadId,
+                  cand.threadId
+                ))
+            ) {
+              return true;
+            }
+            return false;
           }
           return true;
         };
@@ -4222,6 +4822,7 @@
               editHistory: sanitizeEditHistoryList(editHistory, savedText || ''),
               attachments: sanitizeAttachmentsList(attachments),
               personName: savedSender || rowSenderName || '',
+              personAliases: rowAliases,
               threadName,
               senderName: threadName,
               anchorAboveText,
@@ -4318,9 +4919,9 @@
           renderRestoredContentInDom(rowEl, noticeEl, cleanRestored);
 
           const rawPerson = chooseBestPersonName(
+            noticePerson,
             cleanRestored.personName,
             rowSenderName,
-            noticePerson,
             rowEl.dataset?.fbUnsendSavedSender
           );
           const bestPersonName =
@@ -4343,8 +4944,26 @@
           const initialMsgId =
             fiberId || cleanRestored.messageId || `unsend_${getMonotonicTimestamp()}`;
           const rowE2eeIds = extractPeerIdFromE2EEMsgId(initialMsgId, isSelf);
-          const bestSenderId = cleanRestored.senderId || rowE2eeIds.senderId || '';
-          const bestThreadId = cleanRestored.threadId || rowE2eeIds.threadId || '';
+          const bestSenderId =
+            cleanRestored.senderId || rowSenderId || rowE2eeIds.senderId || '';
+          const bestThreadId =
+            cleanRestored.threadId || rowThreadId || rowE2eeIds.threadId || '';
+          const bestPersonAliases = mergePersonAliasesList(
+            cleanRestored.personAliases,
+            rowAliases,
+            cleanRestored.personName,
+            rowSenderName,
+            noticePerson,
+            bestPersonName
+          );
+          if (!isSelf && bestPersonAliases.length > 0) {
+            registerPersonIdentityAliases(
+              bestSenderId,
+              bestPersonAliases,
+              bestThreadId,
+              isOneToOneRowContext ? bestThreadName : ''
+            );
+          }
 
           if (restoredFromHistory && cleanRestored.messageId) {
             rowEl.dataset.fbUnsendMatchedId = cleanRestored.messageId;
@@ -4352,6 +4971,7 @@
               !restored.hasNativePlaceholder ||
                 (bestSenderId && bestSenderId !== (restored.senderId || '')) ||
                 (bestPersonName && bestPersonName !== (restored.personName || '')) ||
+                (bestPersonAliases.length > (restored.personAliases?.length || 0)) ||
                 (bestThreadName && bestThreadName !== (restored.threadName || '')) ||
                 (bestAnchor && !restored.anchorAboveText) ||
                 (cleanRestored.text && cleanRestored.text !== (restored.text || '')) ||
@@ -4372,6 +4992,7 @@
             editHistory: cleanRestored.editHistory || [],
             attachments: cleanRestored.attachments || [],
             personName: bestPersonName,
+            personAliases: bestPersonAliases,
             threadName: bestThreadName,
             senderName: resolvedSenderName,
             anchorAboveText: bestAnchor,
