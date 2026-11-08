@@ -101,6 +101,9 @@
   }
 
   const messagesById = new Map();
+  const recentByIdMap = new Map();
+  const unsentByIdMap = new Map();
+  const stanzaToRecordMap = new Map();
   const domRowMessages = new WeakMap();
   let recentMessagesList = [];
   let unsentMessagesList = [];
@@ -110,6 +113,47 @@
     if (!obj || typeof obj !== 'object') return obj;
     const { rowEl, chatContainer, ...clean } = obj;
     return clean;
+  }
+
+  function indexRecordLookupKeys(rec, isUnsent = false) {
+    if (!rec || typeof rec !== 'object' || !rec.messageId) return;
+    messagesById.set(rec.messageId, rec);
+    if (isUnsent) {
+      unsentByIdMap.set(rec.messageId, rec);
+    } else {
+      recentByIdMap.set(rec.messageId, rec);
+    }
+    const candidateIds = [
+      rec.messageId,
+      rec.originalMessageId,
+      rec.revokeMessageId,
+      rec.fiberMsgId
+    ];
+    for (const cid of candidateIds) {
+      if (!cid || typeof cid !== 'string') continue;
+      const st = extractBareStanzaId(cid);
+      if (st) {
+        stanzaToRecordMap.set(st, rec);
+      }
+    }
+  }
+
+  function rebuildRecentMapsFromList() {
+    recentByIdMap.clear();
+    for (const msg of recentMessagesList) {
+      if (msg && msg.messageId) {
+        indexRecordLookupKeys(msg, false);
+      }
+    }
+  }
+
+  function rebuildUnsentMapsFromList() {
+    unsentByIdMap.clear();
+    for (const msg of unsentMessagesList) {
+      if (msg && msg.messageId) {
+        indexRecordLookupKeys(msg, true);
+      }
+    }
   }
 
   dlog('INIT', '#00a8ff', 'content.js đã khởi tạo tại', location.href);
@@ -907,13 +951,16 @@
     unsentMessagesList.forEach(extractAndIndexIds);
     recentMessagesList.forEach(extractAndIndexIds);
 
-    const tryEnrich = (item) => {
+    let changedUnsent = false;
+    let changedRecent = false;
+    const tryEnrich = (item, isUnsentList) => {
       if (!item || typeof item !== 'object') return;
+      let itemChanged = false;
       if (!item.isSelf && !item.senderId && item.personName) {
         const key = buildScopedAvatarKey(item.threadName || item.personName, item.personName);
         if (key && knownSenderIdByScopedKey.has(key)) {
           item.senderId = knownSenderIdByScopedKey.get(key);
-          changed = true;
+          itemChanged = true;
         }
       }
       const resolved = resolveAvatarForPerson(
@@ -925,13 +972,19 @@
       );
       if (resolved && resolved !== item.avatarUrl) {
         item.avatarUrl = resolved;
+        itemChanged = true;
+      }
+      if (itemChanged) {
+        item.updatedAt = Date.now();
         changed = true;
+        if (isUnsentList) changedUnsent = true;
+        else changedRecent = true;
       }
     };
-    unsentMessagesList.forEach(tryEnrich);
-    recentMessagesList.forEach(tryEnrich);
+    unsentMessagesList.forEach((item) => tryEnrich(item, true));
+    recentMessagesList.forEach((item) => tryEnrich(item, false));
     if (changed) {
-      saveToStorage();
+      saveToStorage({ recent: changedRecent, unsent: changedUnsent, immediate: false });
     }
   }
 
@@ -1300,6 +1353,9 @@
               recentMessagesList = [];
               unsentMessagesList = [];
               messagesById.clear();
+              recentByIdMap.clear();
+              unsentByIdMap.clear();
+              stanzaToRecordMap.clear();
               scheduleDomScan();
               return;
             }
@@ -1381,11 +1437,7 @@
                 recentMessagesList = recentMessagesList.slice(-MAX_STORED_MESSAGES);
                 needsResave = true;
               }
-              for (const msg of recentMessagesList) {
-                if (msg.messageId) {
-                  messagesById.set(msg.messageId, msg);
-                }
-              }
+              rebuildRecentMapsFromList();
             }
 
             const rawStoredUnsent = [
@@ -1422,23 +1474,30 @@
                 .filter((msg) => msg.text || (msg.attachments && msg.attachments.length > 0));
 
               const dedupedUnsent = [];
+              const dedupedIdxById = new Map();
               for (const item of sanitizedUnsent) {
-                const dupIdx = dedupedUnsent.findIndex((existing) => {
-                  if (existing.messageId === item.messageId) return true;
-                  if (existing.isSelf !== item.isSelf) return false;
-                  const sameText =
-                    Boolean(existing.text) &&
-                    existing.text.trim() === (item.text || '').trim();
-                  if (!sameText) return false;
-                  const timeA = existing.unsentAt || existing.timestamp || 0;
-                  const timeB = item.unsentAt || item.timestamp || 0;
-                  const closeInTime = Math.abs(timeA - timeB) < 25000;
-                  const sameAnchor =
-                    Boolean(existing.anchorAboveText) &&
-                    existing.anchorAboveText.trim().toLowerCase() ===
-                      (item.anchorAboveText || '').trim().toLowerCase();
-                  return closeInTime && (sameAnchor || isTempDomId(existing.messageId) || isTempDomId(item.messageId));
-                });
+                let dupIdx =
+                  item.messageId && dedupedIdxById.has(item.messageId)
+                    ? dedupedIdxById.get(item.messageId)
+                    : -1;
+                if (dupIdx === -1) {
+                  dupIdx = dedupedUnsent.findIndex((existing) => {
+                    if (existing.messageId === item.messageId) return true;
+                    if (existing.isSelf !== item.isSelf) return false;
+                    const sameText =
+                      Boolean(existing.text) &&
+                      existing.text.trim() === (item.text || '').trim();
+                    if (!sameText) return false;
+                    const timeA = existing.unsentAt || existing.timestamp || 0;
+                    const timeB = item.unsentAt || item.timestamp || 0;
+                    const closeInTime = Math.abs(timeA - timeB) < 25000;
+                    const sameAnchor =
+                      Boolean(existing.anchorAboveText) &&
+                      existing.anchorAboveText.trim().toLowerCase() ===
+                        (item.anchorAboveText || '').trim().toLowerCase();
+                    return closeInTime && (sameAnchor || isTempDomId(existing.messageId) || isTempDomId(item.messageId));
+                  });
+                }
 
                 if (dupIdx !== -1) {
                   needsResave = true;
@@ -1449,20 +1508,18 @@
                       ...item,
                       hasNativePlaceholder: Boolean(prev.hasNativePlaceholder || item.hasNativePlaceholder)
                     };
+                    if (item.messageId) dedupedIdxById.set(item.messageId, dupIdx);
                   } else {
                     prev.hasNativePlaceholder = Boolean(prev.hasNativePlaceholder || item.hasNativePlaceholder);
                   }
                 } else {
+                  if (item.messageId) dedupedIdxById.set(item.messageId, dedupedUnsent.length);
                   dedupedUnsent.push(item);
                 }
               }
 
               unsentMessagesList = dedupedUnsent;
-              for (const msg of unsentMessagesList) {
-                if (msg.messageId) {
-                  messagesById.set(msg.messageId, msg);
-                }
-              }
+              rebuildUnsentMapsFromList();
             }
             if (repairPollutedIdsAndAvatarsInLists()) {
               needsResave = true;
@@ -1474,7 +1531,7 @@
               currentUserFullName
             });
             if (needsResave) {
-              saveToStorage();
+              saveToStorage({ recent: true, unsent: true, immediate: false });
             }
             archiveAllPendingUnsentMedia();
             scheduleDomScan();
@@ -1569,10 +1626,11 @@
 
     if (changed) {
       record.attachments = nextAttachments;
+      record.updatedAt = Date.now();
       if (record.messageId) {
-        messagesById.set(record.messageId, record);
+        indexRecordLookupKeys(record, true);
       }
-      saveToStorage();
+      saveToStorage({ recent: false, unsent: true, immediate: true });
     }
     return changed;
   }
@@ -1657,56 +1715,114 @@
     } catch (_) {}
   }
 
+  const SAVE_DEBOUNCE_RECENT_MS = 1800;
+  const SAVE_DEBOUNCE_UNSENT_MS = 150;
   let saveTimeout = null;
+  let saveScheduledDelay = 0;
+  let dirtyRecent = false;
+  let dirtyUnsent = false;
   let localSaveInFlightCount = 0;
   let lastLocalSaveCompletedAt = 0;
 
-  function saveToStorage() {
+  function flushSaveToStorageNow() {
+    if (saveTimeout) {
+      clearTimeout(saveTimeout);
+      saveTimeout = null;
+      saveScheduledDelay = 0;
+    }
+    if (!dirtyRecent && !dirtyUnsent) return;
+
+    const shouldSaveRecent = dirtyRecent;
+    const shouldSaveUnsent = dirtyUnsent;
+    dirtyRecent = false;
+    dirtyUnsent = false;
+
     if (!isExtensionContextValid()) {
       saveOrphanedBridgeToLocalStorage();
       return;
     }
-    if (saveTimeout) clearTimeout(saveTimeout);
-    saveTimeout = setTimeout(() => {
-      if (!isExtensionContextValid()) {
-        saveOrphanedBridgeToLocalStorage();
-        return;
-      }
-      try {
+
+    try {
+      const payload = {};
+      if (shouldSaveRecent) {
         if (recentMessagesList.length > MAX_STORED_MESSAGES) {
-          recentMessagesList = recentMessagesList.slice(-MAX_STORED_MESSAGES);
-        }
-        const cleanRecent = recentMessagesList.map(stripDomReferences);
-        const cleanUnsent = unsentMessagesList.map(stripDomReferences);
-        recentMessagesList = cleanRecent;
-        unsentMessagesList = cleanUnsent;
-        localSaveInFlightCount++;
-        chrome.storage.local.set(
-          {
-            [STORAGE_KEY_MESSAGES]: cleanRecent,
-            [STORAGE_KEY_UNSENT]: cleanUnsent
-          },
-          () => {
-            localSaveInFlightCount = Math.max(0, localSaveInFlightCount - 1);
-            lastLocalSaveCompletedAt = Date.now();
-            if (chrome.runtime?.lastError) {
-              dlog('STORAGE-ERROR', '#e84118', 'Lỗi khi lưu chrome.storage.local:', chrome.runtime.lastError);
-              saveOrphanedBridgeToLocalStorage();
-            } else {
-              dlog('STORAGE-SAVED', '#00b894', {
-                capturedCount: cleanRecent.length,
-                unsentCount: cleanUnsent.length
-              });
+          const overflow = recentMessagesList.length - MAX_STORED_MESSAGES;
+          const removed = recentMessagesList.splice(0, overflow);
+          for (const oldRec of removed) {
+            if (oldRec?.messageId && !unsentByIdMap.has(oldRec.messageId)) {
+              recentByIdMap.delete(oldRec.messageId);
+              messagesById.delete(oldRec.messageId);
             }
           }
-        );
-      } catch (err) {
-        localSaveInFlightCount = Math.max(0, localSaveInFlightCount - 1);
-        dlog('STORAGE-EXCEPTION', '#e84118', 'Exception trong saveToStorage:', err);
-        saveOrphanedBridgeToLocalStorage();
+        }
+        const cleanRecent = recentMessagesList.map(stripDomReferences);
+        recentMessagesList = cleanRecent;
+        payload[STORAGE_KEY_MESSAGES] = cleanRecent;
       }
-    }, 300);
+      if (shouldSaveUnsent) {
+        const cleanUnsent = unsentMessagesList.map(stripDomReferences);
+        unsentMessagesList = cleanUnsent;
+        payload[STORAGE_KEY_UNSENT] = cleanUnsent;
+      }
+      if (Object.keys(payload).length === 0) return;
+
+      localSaveInFlightCount++;
+      chrome.storage.local.set(payload, () => {
+        localSaveInFlightCount = Math.max(0, localSaveInFlightCount - 1);
+        lastLocalSaveCompletedAt = Date.now();
+        if (chrome.runtime?.lastError) {
+          dlog('STORAGE-ERROR', '#e84118', 'Lỗi khi lưu chrome.storage.local:', chrome.runtime.lastError);
+          saveOrphanedBridgeToLocalStorage();
+        } else {
+          dlog('STORAGE-SAVED', '#00b894', {
+            savedRecent: shouldSaveRecent ? recentMessagesList.length : undefined,
+            savedUnsent: shouldSaveUnsent ? unsentMessagesList.length : undefined
+          });
+        }
+      });
+    } catch (err) {
+      localSaveInFlightCount = Math.max(0, localSaveInFlightCount - 1);
+      dlog('STORAGE-EXCEPTION', '#e84118', 'Exception trong saveToStorage:', err);
+      saveOrphanedBridgeToLocalStorage();
+    }
   }
+
+  function saveToStorage(options = { recent: true, unsent: true, immediate: false }) {
+    const saveRecent = options?.recent !== false;
+    const saveUnsent = options?.unsent !== false;
+    const isUrgent = Boolean(options?.immediate || saveUnsent);
+
+    if (saveRecent) dirtyRecent = true;
+    if (saveUnsent) dirtyUnsent = true;
+
+    if (!isExtensionContextValid()) {
+      saveOrphanedBridgeToLocalStorage();
+      return;
+    }
+
+    const delay = isUrgent ? SAVE_DEBOUNCE_UNSENT_MS : SAVE_DEBOUNCE_RECENT_MS;
+    if (saveTimeout) {
+      if (!isUrgent && saveScheduledDelay <= delay) {
+        return;
+      }
+      clearTimeout(saveTimeout);
+    }
+    saveScheduledDelay = delay;
+    saveTimeout = setTimeout(() => {
+      saveTimeout = null;
+      saveScheduledDelay = 0;
+      flushSaveToStorageNow();
+    }, delay);
+  }
+
+  window.addEventListener('pagehide', () => {
+    flushSaveToStorageNow();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      flushSaveToStorageNow();
+    }
+  });
 
   function requestMainWorldFiberScan() {
     try {
@@ -2208,17 +2324,10 @@
     const msgIsSelf = inferRecordIsSelf(msg);
     let existing =
       messagesById.get(msg.messageId) ||
-      (msgStanzaId && msgStanzaId !== msg.messageId ? messagesById.get(msgStanzaId) : null);
-    let duplicateIdx = -1;
-
-    if (!existing && msgStanzaId) {
-      duplicateIdx = recentMessagesList.findIndex(
-        (m) => m && extractBareStanzaId(m.messageId) === msgStanzaId
-      );
-      if (duplicateIdx !== -1) {
-        existing = recentMessagesList[duplicateIdx];
-      }
-    }
+      recentByIdMap.get(msg.messageId) ||
+      (msgStanzaId
+        ? messagesById.get(msgStanzaId) || stanzaToRecordMap.get(msgStanzaId)
+        : null);
 
     if (!existing && (msg.text || (msg.attachments && msg.attachments.length > 0))) {
       const cleanText = (msg.text || '').trim();
@@ -2228,30 +2337,31 @@
         ''
       ).trim();
       const msgTime = msg.timestamp || Date.now();
-      duplicateIdx = recentMessagesList.findIndex((m) => {
-        if (!m || m.messageId === msg.messageId) return false;
+      const scanStart = Math.max(0, recentMessagesList.length - 40);
+      for (let i = recentMessagesList.length - 1; i >= scanStart; i--) {
+        const m = recentMessagesList[i];
+        if (!m || m.messageId === msg.messageId) continue;
         const oneIsTemp = isTempDomId(m.messageId) !== isTempDomId(msg.messageId);
-        if (!oneIsTemp) return false;
-        if (typeof m.isSelf === 'boolean' && m.isSelf !== msgIsSelf) return false;
+        if (!oneIsTemp) continue;
+        if (typeof m.isSelf === 'boolean' && m.isSelf !== msgIsSelf) continue;
         const mText = (m.text || '').trim();
         const mFirstHistoryText = (
           (Array.isArray(m.editHistory) && m.editHistory[0]) ||
           mText ||
           ''
         ).trim();
-        if (cleanText && mText === cleanText) {
-          return Math.abs((m.timestamp || 0) - msgTime) < 15000;
+        if (cleanText && mText === cleanText && Math.abs((m.timestamp || 0) - msgTime) < 15000) {
+          existing = m;
+          break;
         }
         if (
           msgFirstHistoryText &&
-          (mFirstHistoryText === msgFirstHistoryText || mText === msgFirstHistoryText)
+          (mFirstHistoryText === msgFirstHistoryText || mText === msgFirstHistoryText) &&
+          Math.abs((m.timestamp || 0) - msgTime) < 600000
         ) {
-          return Math.abs((m.timestamp || 0) - msgTime) < 600000;
+          existing = m;
+          break;
         }
-        return false;
-      });
-      if (duplicateIdx !== -1) {
-        existing = recentMessagesList[duplicateIdx];
       }
     }
 
@@ -2382,13 +2492,15 @@
     const isBrandNew =
       !existing || (!existing.text && merged.text) || historyGrew || existing.text !== merged.text;
 
-    if (existing && existing.messageId && existing.messageId !== bestId) {
-      messagesById.delete(existing.messageId);
+    const oldExistingId = existing?.messageId || '';
+    if (oldExistingId && oldExistingId !== bestId) {
+      messagesById.delete(oldExistingId);
+      recentByIdMap.delete(oldExistingId);
     }
     if (msg.messageId && msg.messageId !== bestId) {
       messagesById.delete(msg.messageId);
+      recentByIdMap.delete(msg.messageId);
     }
-    messagesById.set(bestId, merged);
 
     if (contextRow instanceof HTMLElement) {
       if (!isTempDomId(bestId)) {
@@ -2413,26 +2525,19 @@
       }
     }
 
-    const idx =
-      duplicateIdx !== -1
-        ? duplicateIdx
-        : recentMessagesList.findIndex((m) => m.messageId === bestId || m.messageId === msg.messageId);
-    if (idx !== -1) {
-      recentMessagesList[idx] = merged;
-      for (let i = recentMessagesList.length - 1; i >= 0; i--) {
-        if (
-          i !== idx &&
-          recentMessagesList[i] &&
-          (recentMessagesList[i].messageId === bestId ||
-            recentMessagesList[i].messageId === msg.messageId ||
-            (existing?.messageId && recentMessagesList[i].messageId === existing.messageId))
-        ) {
-          recentMessagesList.splice(i, 1);
-        }
+    let targetRec = merged;
+    if (existing && typeof existing === 'object') {
+      Object.assign(existing, merged);
+      delete existing.rowEl;
+      delete existing.chatContainer;
+      targetRec = existing;
+      if (!recentByIdMap.has(bestId) && !existing.isUnsent) {
+        recentMessagesList.push(targetRec);
       }
     } else {
-      recentMessagesList.push(merged);
+      recentMessagesList.push(targetRec);
     }
+    indexRecordLookupKeys(targetRec, Boolean(targetRec.isUnsent));
 
     if (isBrandNew) {
       dlog('CAPTURED', '#4cd137', {
@@ -2444,7 +2549,7 @@
       });
     }
 
-    saveToStorage();
+    saveToStorage({ recent: true, unsent: Boolean(targetRec.isUnsent), immediate: false });
   }
 
   function notifyUnreadBadge() {
@@ -2611,16 +2716,18 @@
       unsentMessagesList[existingIdx] = merged;
       if (oldId && oldId !== bestId) {
         messagesById.delete(oldId);
+        unsentByIdMap.delete(oldId);
         document
           .querySelectorAll(`div[data-scope="messages_table"][data-fb-unsend-matched-id="${oldId}"]`)
           .forEach((el) => {
             el.dataset.fbUnsendMatchedId = bestId;
           });
       }
-      messagesById.set(bestId, merged);
+      merged.updatedAt = Date.now();
+      indexRecordLookupKeys(merged, true);
       dlog('UNSENT-MERGED', '#00cec9', 'Cập nhật bản ghi gỡ đã có trong History:', merged);
       updateActiveToastIfPresent(merged);
-      saveToStorage();
+      saveToStorage({ recent: false, unsent: true, immediate: true });
       archiveUnsentRecordMedia(merged);
       return { record: merged, isNew: false };
     }
@@ -2674,13 +2781,14 @@
       attachments: cleanAttachments,
       timestamp: newRecord.timestamp || getMonotonicTimestamp(),
       unsentAt: newRecord.unsentAt || Date.now(),
+      updatedAt: Date.now(),
       isUnsent: true
     });
 
-    messagesById.set(finalRecord.messageId, finalRecord);
+    indexRecordLookupKeys(finalRecord, true);
     unsentMessagesList.unshift(finalRecord);
     dlog('UNSENT-ADDED', '#e84118', 'Đã thêm bản ghi gỡ MỚI vào History:', finalRecord);
-    saveToStorage();
+    saveToStorage({ recent: false, unsent: true, immediate: true });
     archiveUnsentRecordMedia(finalRecord);
     showUnsentToast(finalRecord);
     notifyUnreadBadge();
@@ -2709,15 +2817,10 @@
 
     let existing =
       messagesById.get(unsentData.messageId) ||
+      recentByIdMap.get(unsentData.messageId) ||
       (unsentData.rawMessageId ? messagesById.get(resolveContentCanonicalId(unsentData.rawMessageId)) : null) ||
       (unsentData.rawMessageId ? messagesById.get(unsentData.rawMessageId) : null) ||
-      (unsentStanzaId ? messagesById.get(unsentStanzaId) : null);
-
-    if (!existing && unsentStanzaId) {
-      existing =
-        recentMessagesList.find((m) => m && extractBareStanzaId(m.messageId) === unsentStanzaId) ||
-        null;
-    }
+      (unsentStanzaId ? messagesById.get(unsentStanzaId) || stanzaToRecordMap.get(unsentStanzaId) : null);
 
     if (!existing && unsentData.messageId) {
       existing =
@@ -2971,9 +3074,13 @@
     if (!matchedRecord && originalStanzaId && messagesById.has(originalStanzaId)) {
       matchedRecord = messagesById.get(originalStanzaId);
     }
+    if (!matchedRecord && originalStanzaId && stanzaToRecordMap.has(originalStanzaId)) {
+      matchedRecord = stanzaToRecordMap.get(originalStanzaId);
+    }
     if (!matchedRecord && (originalMsgId || originalStanzaId)) {
       const targetId = originalMsgId || originalStanzaId;
       matchedRecord =
+        recentByIdMap.get(targetId) ||
         recentMessagesList.find((r) => isSameAuthoritativeRecordId(targetId, r)) ||
         recentlyDisappearedMessages.find((d) => isSameAuthoritativeRecordId(targetId, d)) ||
         null;
@@ -4635,9 +4742,11 @@
         if (idUpgraded) {
           currentActiveIds.add(safePrev.messageId);
           messagesById.delete(safePrev.messageId);
-          const oldIdx = recentMessagesList.findIndex((m) => m.messageId === safePrev.messageId);
-          if (oldIdx !== -1) {
-            recentMessagesList[oldIdx].messageId = fiberMsgId;
+          const oldRec = recentByIdMap.get(safePrev.messageId);
+          if (oldRec) {
+            recentByIdMap.delete(safePrev.messageId);
+            oldRec.messageId = fiberMsgId;
+            indexRecordLookupKeys(oldRec, recentByIdMap);
           }
         }
 
@@ -5057,13 +5166,15 @@
         let matchStrategy = '';
 
         if (fiberId) {
-          const fromUnsent = unsentMessagesList.find((u) =>
-            isSameAuthoritativeRecordId(fiberId, u)
-          );
           const fiberStanza = extractBareStanzaId(fiberId);
+          const fromUnsent =
+            unsentByIdMap.get(fiberId) ||
+            unsentMessagesList.find((u) => isSameAuthoritativeRecordId(fiberId, u));
           const fromCaptured =
             messagesById.get(fiberId) ||
             (fiberStanza ? messagesById.get(fiberStanza) : null) ||
+            recentByIdMap.get(fiberId) ||
+            (fiberStanza ? stanzaToRecordMap.get(fiberStanza) : null) ||
             recentMessagesList.find((m) => isSameAuthoritativeRecordId(fiberId, m));
           if (isRecordValidForThisRow(fromUnsent, false, false)) {
             restored = fromUnsent;
@@ -5592,7 +5703,7 @@
     }
 
     if (storageNeedsSave) {
-      saveToStorage();
+      saveToStorage({ recent: false, unsent: true, immediate: false });
     }
   }
 
@@ -6217,7 +6328,19 @@
           if (changes[STORAGE_KEY_MESSAGES]?.newValue) {
             const newMsgs = changes[STORAGE_KEY_MESSAGES].newValue;
             if (Array.isArray(newMsgs)) {
+              let recentDiffCount = 0;
               recentMessagesList = newMsgs.map((msg) => {
+                if (!msg || typeof msg !== 'object') return msg;
+                const prev = msg.messageId ? recentByIdMap.get(msg.messageId) : null;
+                if (
+                  prev &&
+                  (prev.updatedAt || 0) >= (msg.updatedAt || 0) &&
+                  (prev.editHistory?.length || 0) >= (msg.editHistory?.length || 0) &&
+                  prev.avatarUrl === msg.avatarUrl
+                ) {
+                  return prev;
+                }
+                recentDiffCount++;
                 const sanitized = sanitizeStoredRecord(msg);
                 const inMem = sanitized?.messageId ? messagesById.get(sanitized.messageId) : null;
                 if (inMem && (inMem.editHistory?.length || 0) > (sanitized.editHistory?.length || 0)) {
@@ -6229,17 +6352,33 @@
                 }
                 return sanitized;
               });
+              rebuildRecentMapsFromList();
               for (const msg of recentMessagesList) {
-                if (msg.messageId) messagesById.set(msg.messageId, msg);
+                if (msg?.messageId) messagesById.set(msg.messageId, msg);
               }
-              updated = true;
+              if (recentDiffCount > 0) {
+                updated = true;
+              }
             }
           }
           if (changes[STORAGE_KEY_UNSENT]?.newValue) {
             const newUnsent = changes[STORAGE_KEY_UNSENT].newValue;
             if (Array.isArray(newUnsent)) {
+              let unsentDiffCount = 0;
               unsentMessagesList = newUnsent
                 .map((msg) => {
+                  if (!msg || typeof msg !== 'object') return null;
+                  const prev = msg.messageId ? unsentByIdMap.get(msg.messageId) : null;
+                  if (
+                    prev &&
+                    (prev.updatedAt || 0) >= (msg.updatedAt || 0) &&
+                    (prev.editHistory?.length || 0) >= (msg.editHistory?.length || 0) &&
+                    prev.avatarUrl === msg.avatarUrl &&
+                    (prev.attachments?.length || 0) >= (msg.attachments?.length || 0)
+                  ) {
+                    return prev;
+                  }
+                  unsentDiffCount++;
                   const sanitized = sanitizeStoredRecord(msg);
                   const inMem = sanitized?.messageId ? messagesById.get(sanitized.messageId) : null;
                   if (inMem && (inMem.editHistory?.length || 0) > (sanitized.editHistory?.length || 0)) {
@@ -6251,11 +6390,14 @@
                   }
                   return sanitized;
                 })
-                .filter((msg) => msg.text || (msg.attachments && msg.attachments.length > 0));
+                .filter((msg) => msg && (msg.text || (msg.attachments && msg.attachments.length > 0)));
+              rebuildUnsentMapsFromList();
               for (const msg of unsentMessagesList) {
                 if (msg.messageId) messagesById.set(msg.messageId, msg);
               }
-              updated = true;
+              if (unsentDiffCount > 0) {
+                updated = true;
+              }
             }
           }
           if (updated) {

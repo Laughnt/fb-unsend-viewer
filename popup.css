@@ -1459,6 +1459,7 @@ button {
   background: var(--control);
   color: var(--text);
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .btn:hover {
@@ -1571,6 +1572,16 @@ button {
 /* ===== Hộp thoại Debug ===== */
 .debug-card {
   position: relative;
+}
+
+.debug-card #debug-cancel-btn {
+  flex: 0 0 auto;
+  min-width: 84px;
+}
+
+.debug-card #debug-export-btn {
+  flex: 1;
+  white-space: nowrap;
 }
 
 .debug-modal-icon {
