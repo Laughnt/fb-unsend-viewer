@@ -8,7 +8,7 @@
 
   <p>
     <img src="https://img.shields.io/badge/Manifest-V3-2563eb?style=flat-square&logo=googlechrome&logoColor=white" alt="Manifest V3" />
-    <img src="https://img.shields.io/badge/Version-1.3.0-7c3aed?style=flat-square" alt="Version 1.3.0" />
+    <img src="https://img.shields.io/badge/Version-1.3.1-7c3aed?style=flat-square" alt="Version 1.3.1" />
     <img src="https://img.shields.io/badge/Privacy-100%25%20Local-10b981?style=flat-square" alt="100% Local Privacy" />
     <img src="https://img.shields.io/badge/License-Non--Commercial%20(by%20binhake)-ef4444?style=flat-square" alt="License Non-Commercial (by binhake)" />
   </p>
@@ -74,7 +74,7 @@
 Bạn có thể cài đặt trên **Google Chrome**, **Microsoft Edge**, **Brave**, **Cốc Cốc**, hoặc bất kỳ trình duyệt nhân Chromium nào.
 
 #### Cách 1: Tải bản đóng gói sẵn (Khuyên dùng)
-1. Truy cập mục [**Releases**](../../releases) ở góc phải trang GitHub này và tải tệp `fb-unsend-viewer-v1.3.0.zip` mới nhất.
+1. Truy cập mục [**Releases**](../../releases) ở góc phải trang GitHub này và tải tệp `fb-unsend-viewer-v1.3.1.zip` mới nhất.
 2. Giải nén tệp `.zip` ra một thư mục cố định trên máy tính.
 3. Mở trình duyệt và truy cập đường dẫn quản lý tiện ích:
    - **Chrome**: `chrome://extensions/`
@@ -185,7 +185,7 @@ Dự án thuộc quyền sở hữu trí tuệ và bản quyền của **[binhak
 Compatible with **Google Chrome**, **Microsoft Edge**, **Brave**, **Opera**, and all Chromium-based browsers.
 
 #### Option 1: Download from Releases (Recommended)
-1. Go to the [**Releases**](../../releases) page and download the latest `fb-unsend-viewer-v1.3.0.zip`.
+1. Go to the [**Releases**](../../releases) page and download the latest `fb-unsend-viewer-v1.3.1.zip`.
 2. Extract the `.zip` archive to a permanent folder on your computer.
 3. Open your browser's extensions page:
    - **Chrome**: `chrome://extensions/`
