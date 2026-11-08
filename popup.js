@@ -2097,6 +2097,18 @@ function isOpenedAsPopup() {
   }
 }
 
+function hasChromeSidePanelApi() {
+  return Boolean(chrome.sidePanel && typeof chrome.sidePanel.open === 'function');
+}
+
+function hasFirefoxSidebarApi() {
+  return Boolean(
+    typeof browser !== 'undefined' &&
+      browser.sidebarAction &&
+      typeof browser.sidebarAction.open === 'function'
+  );
+}
+
 function setupSidePanel() {
   if (!isOpenedAsPopup()) {
     document.documentElement.classList.add('is-panel');
@@ -2106,17 +2118,33 @@ function setupSidePanel() {
     });
     return;
   }
-  if (!chrome.sidePanel || typeof chrome.sidePanel.open !== 'function') return;
+  const hasChromeSidePanel = hasChromeSidePanelApi();
+  const hasFirefoxSidebar = hasFirefoxSidebarApi();
+  if (!hasChromeSidePanel && !hasFirefoxSidebar) return;
 
   // Lấy sẵn windowId: sidePanel.open phải gọi ngay trong lúc bấm, không chờ callback
   let currentWindowId = null;
+  if (hasFirefoxSidebar) {
+    dom.panelBtn.hidden = false;
+  }
   chrome.windows.getCurrent(function (win) {
     currentWindowId = win ? win.id : null;
-    dom.panelBtn.hidden = currentWindowId === null;
+    dom.panelBtn.hidden = !hasFirefoxSidebar && currentWindowId === null;
     if (currentWindowId !== null) watchSidePanel(currentWindowId);
   });
 
   dom.panelBtn.addEventListener('click', function () {
+    if (hasFirefoxSidebar) {
+      browser.sidebarAction
+        .open()
+        .then(function () {
+          window.close();
+        })
+        .catch(function () {
+          showStatus('Trình duyệt chưa hỗ trợ thanh bên', true);
+        });
+      return;
+    }
     if (currentWindowId === null) return;
     chrome.sidePanel
       .open({ windowId: currentWindowId })
@@ -2134,6 +2162,8 @@ function watchSidePanel(windowId) {
   const panelNotice = document.getElementById('panel-notice');
   const panelCloseBtn = document.getElementById('panel-close-btn');
   const panelStayBtn = document.getElementById('panel-stay-btn');
+  const hasChromeSidePanel = hasChromeSidePanelApi();
+  const hasFirefoxSidebar = hasFirefoxSidebarApi();
   let stayHere = false;
 
   function setNotice(isPanelOpen) {
@@ -2157,6 +2187,17 @@ function watchSidePanel(windowId) {
       setNotice(true);
       return;
     }
+    if (hasFirefoxSidebar && typeof browser.sidebarAction.isOpen === 'function') {
+      browser.sidebarAction
+        .isOpen({ windowId: windowId })
+        .then(function (isOpen) {
+          setNotice(Boolean(isOpen));
+        })
+        .catch(function () {
+          setNotice(false);
+        });
+      return;
+    }
     if (!chrome.runtime.getContexts) {
       setNotice(false);
       return;
@@ -2176,10 +2217,18 @@ function watchSidePanel(windowId) {
       });
   }
 
-  // sidePanel.close có từ Chrome 141, bản cũ hơn thì ẩn nút
-  panelCloseBtn.hidden = typeof chrome.sidePanel.close !== 'function';
+  const canCloseFirefoxSidebar = hasFirefoxSidebar && typeof browser.sidebarAction.close === 'function';
+  const canCloseChromeSidePanel = hasChromeSidePanel && typeof chrome.sidePanel.close === 'function';
+  // sidePanel.close có từ Chrome 141, Firefox hỗ trợ sidebarAction.close
+  panelCloseBtn.hidden = !canCloseFirefoxSidebar && !canCloseChromeSidePanel;
   panelCloseBtn.addEventListener('click', function () {
-    chrome.sidePanel.close({ windowId: windowId }).then(checkSidePanel).catch(function () {});
+    if (canCloseFirefoxSidebar) {
+      browser.sidebarAction.close().then(checkSidePanel).catch(function () {});
+      return;
+    }
+    if (canCloseChromeSidePanel) {
+      chrome.sidePanel.close({ windowId: windowId }).then(checkSidePanel).catch(function () {});
+    }
   });
   // Nút "Vẫn xem ở đây" đang tạm ẩn trong popup.html
   if (panelStayBtn) {
