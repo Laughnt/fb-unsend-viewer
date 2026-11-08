@@ -429,10 +429,18 @@
     return out;
   }
 
-  function registerPersonIdentityAliases(senderId = '', names = [], threadName = '') {
+  function registerPersonIdentityAliases(
+    senderId = '',
+    names = [],
+    threadOrId = '',
+    altThreadName = ''
+  ) {
     let changed = false;
     const cleanId = senderId ? String(senderId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '') : '';
     const validNames = mergePersonAliasesList(names);
+    const candidateThreads = [threadOrId, altThreadName]
+      .map((t) => (typeof t === 'string' ? t.trim() : ''))
+      .filter((t) => t && !/^\d+$/.test(t) && !isGenericSenderName(t));
 
     for (let i = 0; i < validNames.length; i++) {
       for (let j = i + 1; j < validNames.length; j++) {
@@ -453,8 +461,8 @@
           idSet.add(lower);
           changed = true;
         }
-        if (threadName) {
-          const scopedKey = buildScopedAvatarKey(threadName, n);
+        for (const tName of candidateThreads) {
+          const scopedKey = buildScopedAvatarKey(tName, n);
           if (scopedKey && !personIdByThreadAndNameMap.has(scopedKey)) {
             personIdByThreadAndNameMap.set(scopedKey, cleanId);
           }
@@ -506,14 +514,36 @@
     return `${cleanThread || cleanPerson}__${cleanPerson}`;
   }
 
-  function recordDomAvatarForThreadAndPerson(threadName, personName, avatarUrl, senderId = '') {
+  function recordDomAvatarForThreadAndPerson(
+    threadName,
+    personName,
+    avatarUrl,
+    senderId = '',
+    extraAliases = []
+  ) {
     let updated = false;
-    const scopedKey = buildScopedAvatarKey(threadName, personName);
     const cleanId = senderId ? String(senderId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '') : '';
+    const allNames = mergePersonAliasesList(personName, extraAliases);
+    const cleanPersonLower = (personName || '').trim().toLowerCase();
+    if (cleanPersonLower && peerNameAliasSetMap.has(cleanPersonLower)) {
+      for (const linked of peerNameAliasSetMap.get(cleanPersonLower)) {
+        if (!allNames.some((n) => n.toLowerCase() === linked)) {
+          allNames.push(linked);
+        }
+      }
+    }
 
-    if (cleanId && scopedKey && personIdByThreadAndNameMap.get(scopedKey) !== cleanId) {
-      personIdByThreadAndNameMap.set(scopedKey, cleanId);
-      updated = true;
+    const scopedKeys = allNames
+      .map((n) => buildScopedAvatarKey(threadName, n))
+      .filter(Boolean);
+
+    if (cleanId) {
+      for (const sk of scopedKeys) {
+        if (personIdByThreadAndNameMap.get(sk) !== cleanId) {
+          personIdByThreadAndNameMap.set(sk, cleanId);
+          updated = true;
+        }
+      }
     }
 
     if (!avatarUrl || typeof avatarUrl !== 'string' || !/^https?:\/\//i.test(avatarUrl)) {
@@ -524,9 +554,11 @@
       personAvatarByIdMap.set(cleanId, cleanUrl);
       updated = true;
     }
-    if (scopedKey && personAvatarByThreadAndNameMap.get(scopedKey) !== cleanUrl) {
-      personAvatarByThreadAndNameMap.set(scopedKey, cleanUrl);
-      updated = true;
+    for (const sk of scopedKeys) {
+      if (personAvatarByThreadAndNameMap.get(sk) !== cleanUrl) {
+        personAvatarByThreadAndNameMap.set(sk, cleanUrl);
+        updated = true;
+      }
     }
     return updated;
   }
@@ -539,8 +571,18 @@
     threadName = ''
   ) {
     const scopedKey = buildScopedAvatarKey(threadName, personName);
-    const rawSenderId =
+    let rawSenderId =
       senderId || (!isSelf && scopedKey ? personIdByThreadAndNameMap.get(scopedKey) || '' : '');
+    const cleanPersonLower = (personName || '').trim().toLowerCase();
+    if (!rawSenderId && !isSelf && cleanPersonLower && peerNameAliasSetMap.has(cleanPersonLower)) {
+      for (const alias of peerNameAliasSetMap.get(cleanPersonLower)) {
+        const aliasKey = buildScopedAvatarKey(threadName, alias);
+        if (aliasKey && personIdByThreadAndNameMap.has(aliasKey)) {
+          rawSenderId = personIdByThreadAndNameMap.get(aliasKey) || '';
+          if (rawSenderId) break;
+        }
+      }
+    }
     const cleanSenderId = rawSenderId
       ? String(rawSenderId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '')
       : '';
@@ -552,6 +594,14 @@
     }
     if (scopedKey && personAvatarByThreadAndNameMap.has(scopedKey)) {
       return personAvatarByThreadAndNameMap.get(scopedKey) || '';
+    }
+    if (!isSelf && cleanPersonLower && peerNameAliasSetMap.has(cleanPersonLower)) {
+      for (const alias of peerNameAliasSetMap.get(cleanPersonLower)) {
+        const aliasKey = buildScopedAvatarKey(threadName, alias);
+        if (aliasKey && personAvatarByThreadAndNameMap.has(aliasKey)) {
+          return personAvatarByThreadAndNameMap.get(aliasKey) || '';
+        }
+      }
     }
     if (fallbackAvatar && typeof fallbackAvatar === 'string' && /^https?:\/\//i.test(fallbackAvatar)) {
       return fallbackAvatar.trim();
@@ -3115,11 +3165,12 @@
     });
   }
 
-  function extractAvatarFromChatRow(rowEl, rowSenderName = '') {
+  function extractAvatarFromChatRow(rowEl, rowSenderName = '', rowAvatarAltSender = '') {
     if (!rowEl || !(rowEl instanceof HTMLElement)) return '';
     try {
       const rowRect = rowEl.getBoundingClientRect();
       const cleanSenderLower = (rowSenderName || '').trim().toLowerCase();
+      const cleanAltLower = (rowAvatarAltSender || '').trim().toLowerCase();
       const imgs = rowEl.querySelectorAll('img');
       for (const imgEl of imgs) {
         if (
@@ -3139,17 +3190,28 @@
         }
         const alt = (imgEl.getAttribute('alt') || '').trim();
         if (/^(Đã xem|Seen by)/i.test(alt)) continue;
-        if (cleanSenderLower && alt && alt.toLowerCase() === cleanSenderLower) {
+        const altLower = alt.toLowerCase();
+        if (
+          altLower &&
+          ((cleanSenderLower &&
+            (altLower === cleanSenderLower || areNamesLinkedAliases(altLower, cleanSenderLower))) ||
+            (cleanAltLower && altLower === cleanAltLower))
+        ) {
           return src;
         }
         const rect = imgEl.getBoundingClientRect();
         const attrW = parseFloat(imgEl.getAttribute('width') || '0') || 0;
         const attrH = parseFloat(imgEl.getAttribute('height') || '0') || 0;
-        const w = rect.width || attrW;
-        const h = rect.height || attrH;
+        const w = rect.width || imgEl.clientWidth || attrW;
+        const h = rect.height || imgEl.clientHeight || attrH;
         const isLeftSide =
           rowRect.width <= 0 || rect.left <= rowRect.left + Math.min(90, rowRect.width * 0.35);
-        if (w >= 22 && w <= 52 && h >= 22 && h <= 52 && isLeftSide) {
+        const isProfilePicUrl =
+          /\/t39\.30808-1\/|p50x50|p100x100|s100x100|p60x60|p40x40|dst-jpg_s\d+x\d+/i.test(src);
+        if (
+          isLeftSide &&
+          ((w >= 20 && w <= 52 && h >= 20 && h <= 52) || (w === 0 && isProfilePicUrl))
+        ) {
           return src;
         }
       }
@@ -3199,7 +3261,7 @@
     const rowSenderName = senderDetails.primarySender;
     const rowHeaderSender = senderDetails.headerSender;
     const rowAvatarAltSender = senderDetails.avatarAltSender;
-    const rowAvatarUrl = extractAvatarFromChatRow(rowEl, rowSenderName || rowAvatarAltSender);
+    const rowAvatarUrl = extractAvatarFromChatRow(rowEl, rowSenderName, rowAvatarAltSender);
 
     const hasRestoredDomNodes = Array.from(
       rowEl.querySelectorAll(
@@ -4209,7 +4271,8 @@
                 threadName,
                 avPerson,
                 analysis.rowAvatarUrl,
-                unsentSenderId
+                unsentSenderId,
+                unsentRowAliases
               )
             ) {
               backfillAvatarsInStoredLists();
@@ -4238,6 +4301,7 @@
             threadId: unsentThreadId,
             senderId: unsentSenderId,
             personAliases: unsentRowAliases,
+            rowAvatarUrl: analysis.rowAvatarUrl || '',
             chatContainer: container,
             anchorAboveText,
             anchorAboveSender,
@@ -4423,7 +4487,8 @@
               threadName,
               personName,
               analysis.rowAvatarUrl,
-              resolvedSenderId
+              resolvedSenderId,
+              rowPersonAliases
             )
           ) {
             backfillAvatarsInStoredLists();
@@ -4646,6 +4711,7 @@
         threadId: rowThreadId,
         senderId: rowSenderId,
         personAliases: rowAliases,
+        rowAvatarUrl,
         chatContainer,
         anchorAboveText,
         isSelf,
@@ -4960,15 +5026,23 @@
             registerPersonIdentityAliases(
               bestSenderId,
               bestPersonAliases,
-              bestThreadId,
+              bestThreadName,
               isOneToOneRowContext ? bestThreadName : ''
             );
           }
+          const bestAvatarUrl = resolveAvatarForPerson(
+            bestPersonName,
+            bestSenderId,
+            isSelf,
+            rowAvatarUrl || cleanRestored.avatarUrl || '',
+            bestThreadName
+          );
 
           if (restoredFromHistory && cleanRestored.messageId) {
             rowEl.dataset.fbUnsendMatchedId = cleanRestored.messageId;
             const needsHistoryEnrich = Boolean(
               !restored.hasNativePlaceholder ||
+                (bestAvatarUrl && bestAvatarUrl !== (restored.avatarUrl || '')) ||
                 (bestSenderId && bestSenderId !== (restored.senderId || '')) ||
                 (bestPersonName && bestPersonName !== (restored.personName || '')) ||
                 (bestPersonAliases.length > (restored.personAliases?.length || 0)) ||
@@ -4988,6 +5062,7 @@
             isSelf,
             senderId: bestSenderId,
             threadId: bestThreadId,
+            avatarUrl: bestAvatarUrl,
             text: cleanRestored.text || '',
             editHistory: cleanRestored.editHistory || [],
             attachments: cleanRestored.attachments || [],

@@ -815,6 +815,46 @@ function repairPopupListsIdsAndAvatars(unsentList, capturedList) {
     }
   }
 
+  const aliasSetByName = new Map();
+  const linkPopupAliasPair = (aRaw, bRaw) => {
+    const a = String(aRaw || '').trim().toLowerCase();
+    const b = String(bRaw || '').trim().toLowerCase();
+    if (!a || !b || a === b || isGenericName(a) || isGenericName(b)) return;
+    if (/^(người dùng facebook|bạn|you|chính bạn)$/i.test(a)) return;
+    if (/^(người dùng facebook|bạn|you|chính bạn)$/i.test(b)) return;
+    if (!aliasSetByName.has(a)) aliasSetByName.set(a, new Set());
+    if (!aliasSetByName.has(b)) aliasSetByName.set(b, new Set());
+    aliasSetByName.get(a).add(b);
+    aliasSetByName.get(b).add(a);
+  };
+
+  for (const { rec } of entries) {
+    const pName = getExplicitLowerPerson(rec);
+    const aliases = Array.isArray(rec.personAliases) ? rec.personAliases : [];
+    const allForRec = pName ? [pName, ...aliases] : [...aliases];
+    for (let i = 0; i < allForRec.length; i++) {
+      for (let j = i + 1; j < allForRec.length; j++) {
+        linkPopupAliasPair(allForRec[i], allForRec[j]);
+      }
+    }
+  }
+
+  const areLinkedPopupNames = (nameA, nameB, rec = null) => {
+    const a = String(nameA || '').trim().toLowerCase();
+    const b = String(nameB || '').trim().toLowerCase();
+    if (!a || !b) return false;
+    if (a === b) return true;
+    if (aliasSetByName.get(a)?.has(b) || aliasSetByName.get(b)?.has(a)) return true;
+    if (rec && Array.isArray(rec.personAliases)) {
+      const lowerAliases = rec.personAliases.map(x => String(x || '').trim().toLowerCase());
+      if (lowerAliases.includes(a) && lowerAliases.includes(b)) return true;
+      const recPerson = getExplicitLowerPerson(rec);
+      if (recPerson === a && lowerAliases.includes(b)) return true;
+      if (recPerson === b && lowerAliases.includes(a)) return true;
+    }
+    return false;
+  };
+
   const senderIdNameCounts = new Map();
   for (const { rec } of entries) {
     const sId = String(rec.senderId || '').trim();
@@ -859,7 +899,7 @@ function repairPopupListsIdsAndAvatars(unsentList, capturedList) {
     const m = rawMid.match(/^(\d{6,25})@msgr\.\d+$/);
     if (m && m[1] === sId) continue;
     const owner = validOwnerBySenderId.get(sId);
-    if (owner && owner !== pName) {
+    if (owner && owner !== pName && !areLinkedPopupNames(owner, pName, rec)) {
       rec.senderId = '';
       corruptedSet.add(rec);
       markChanged(entry);
@@ -901,7 +941,8 @@ function repairPopupListsIdsAndAvatars(unsentList, capturedList) {
     const av = String(rec.avatarUrl || '').trim();
     const pName = getExplicitLowerPerson(rec);
     if (!av || !pName) continue;
-    if (avatarTrueOwner.has(av) && avatarTrueOwner.get(av) !== pName) {
+    const trueOwner = avatarTrueOwner.get(av);
+    if (trueOwner && trueOwner !== pName && !areLinkedPopupNames(trueOwner, pName, rec)) {
       rec.avatarUrl = '';
       markChanged(entry);
     }
@@ -910,13 +951,31 @@ function repairPopupListsIdsAndAvatars(unsentList, capturedList) {
   return { unsentChanged, capturedChanged };
 }
 
+function areRecordNamesCompatible(itemA, personA, itemB, personB) {
+  const a = String(personA || '').trim().toLowerCase();
+  const b = String(personB || '').trim().toLowerCase();
+  if (!a || !b) return true;
+  if (a === b) return true;
+  const aliasesA = Array.isArray(itemA?.personAliases)
+    ? itemA.personAliases.map(x => String(x || '').trim().toLowerCase()).filter(Boolean)
+    : [];
+  const aliasesB = Array.isArray(itemB?.personAliases)
+    ? itemB.personAliases.map(x => String(x || '').trim().toLowerCase()).filter(Boolean)
+    : [];
+  if (aliasesA.includes(b) || aliasesB.includes(a)) return true;
+  for (const al of aliasesA) {
+    if (aliasesB.includes(al)) return true;
+  }
+  return false;
+}
+
 function findBestAvatarForItem(item, person, thread, isSelf) {
   const cleanPerson = (person || '').trim().toLowerCase();
   const cleanThread = (thread || person || '').trim().toLowerCase();
   const senderId = extractSenderIdFromRecord(item, isSelf);
   const pools = [appState.unsentMessages, appState.capturedMessages];
 
-  // 1. Ưu tiên tuyệt đối: khớp theo UID (senderId) VÀ cùng tên người gửi
+  // 1. Ưu tiên tuyệt đối: khớp theo UID (senderId) VÀ cùng người gửi (bao gồm biệt danh <-> tên thật)
   if (senderId) {
     for (const list of pools) {
       if (!Array.isArray(list)) continue;
@@ -925,7 +984,7 @@ function findBestAvatarForItem(item, person, thread, isSelf) {
         const candNames = parseRecordNames(cand);
         const candId = extractSenderIdFromRecord(cand, candNames.isSelf);
         const candPerson = (candNames.person || '').trim().toLowerCase();
-        if (candId && candId === senderId && (!cleanPerson || !candPerson || candPerson === cleanPerson)) {
+        if (candId && candId === senderId && areRecordNamesCompatible(item, cleanPerson, cand, candPerson)) {
           return cand.avatarUrl.trim();
         }
       }
@@ -937,7 +996,7 @@ function findBestAvatarForItem(item, person, thread, isSelf) {
     return item.avatarUrl.trim();
   }
 
-  // 3. Dự phòng: chỉ khớp theo ngữ cảnh cùng đoạn chat + cùng người gửi (không bao giờ khớp toàn cục theo tên)
+  // 3. Dự phòng: chỉ khớp theo ngữ cảnh cùng đoạn chat + cùng người gửi (kể cả biệt danh)
   for (const list of pools) {
     if (!Array.isArray(list)) continue;
     for (const cand of list) {
@@ -949,7 +1008,7 @@ function findBestAvatarForItem(item, person, thread, isSelf) {
       if (!isSelf && !candNames.isSelf && cleanPerson) {
         const candPerson = (candNames.person || '').trim().toLowerCase();
         const candThread = (candNames.thread || candNames.person || '').trim().toLowerCase();
-        if (candPerson === cleanPerson && candThread === cleanThread) {
+        if (candThread === cleanThread && areRecordNamesCompatible(item, cleanPerson, cand, candPerson)) {
           return cand.avatarUrl.trim();
         }
       }
