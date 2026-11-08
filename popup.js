@@ -11,6 +11,7 @@ const STORAGE_KEY_MESSAGES = 'fb_captured_messages_v2';
 const STORAGE_KEY_UNSENT = 'fb_unsent_messages_v2';
 const STORAGE_KEY_CLEANED_FLAG = 'fb_unsend_schema_v4_cleaned';
 const STORAGE_KEY_TOAST_ENABLED = 'fb_unsend_toast_enabled';
+const STORAGE_KEY_DEBUG_ENABLED = 'fb_unsend_debug_enabled';
 const STORAGE_KEY_UPDATE_INFO = 'fb_unsend_update_info_v1';
 const GITHUB_RELEASES_PAGE_URL = 'https://github.com/binhake/fb-unsend-viewer/releases';
 const STATUS_HIDE_MS = 3600;
@@ -66,6 +67,11 @@ function cacheDom() {
   dom.footerInfo = document.getElementById('footer-info');
   dom.versionTag = document.getElementById('version-tag');
   dom.debugBtn = document.getElementById('debug-btn');
+  dom.debugModal = document.getElementById('debug-modal');
+  dom.debugClose = document.getElementById('debug-close');
+  dom.debugCancelBtn = document.getElementById('debug-cancel-btn');
+  dom.debugExportBtn = document.getElementById('debug-export-btn');
+  dom.debugModeToggle = document.getElementById('debug-mode-toggle');
 
   dom.updateBanner = document.getElementById('update-banner');
   dom.updateBannerTitle = document.getElementById('update-banner-title');
@@ -1398,7 +1404,7 @@ function removeUnsentMessage(messageId) {
 }
 
 function loadPopupData(isBackgroundUpdate = false) {
-  chrome.storage.local.get([STORAGE_KEY_UNSENT, STORAGE_KEY_MESSAGES, STORAGE_KEY_TOAST_ENABLED], function (res) {
+  chrome.storage.local.get([STORAGE_KEY_UNSENT, STORAGE_KEY_MESSAGES, STORAGE_KEY_TOAST_ENABLED, STORAGE_KEY_DEBUG_ENABLED], function (res) {
     const rawUnsent = Array.isArray(res[STORAGE_KEY_UNSENT]) ? res[STORAGE_KEY_UNSENT] : [];
     const rawCaptured = Array.isArray(res[STORAGE_KEY_MESSAGES]) ? res[STORAGE_KEY_MESSAGES] : [];
     let unsentChanged = false;
@@ -1428,6 +1434,9 @@ function loadPopupData(isBackgroundUpdate = false) {
 
     // Chưa từng lưu thì coi như đang bật
     dom.toastToggle.checked = res[STORAGE_KEY_TOAST_ENABLED] !== false;
+    const debugEnabled = res[STORAGE_KEY_DEBUG_ENABLED] === true;
+    if (dom.debugModeToggle) dom.debugModeToggle.checked = debugEnabled;
+    if (dom.debugBtn) dom.debugBtn.classList.toggle('is-active', debugEnabled);
     if (isBackgroundUpdate && appState.lastRenderSignature) {
       // dom.footerInfo.textContent = `Lưu tạm ${appState.capturedMessages.length.toLocaleString('vi-VN')} tin để đối chiếu`;
       updateMediaStorageBar();
@@ -1492,24 +1501,73 @@ function exportBackupJson() {
   });
 }
 
+function sanitizePopupDebugRecord(rec, nameMap, uidMap) {
+  if (!rec || typeof rec !== 'object') return rec;
+  const maskUid = v => {
+    const s = String(v || '').trim();
+    if (!s) return '';
+    if (!uidMap.has(s)) uidMap.set(s, `UID#${uidMap.size + 1}`);
+    return uidMap.get(s);
+  };
+  const maskName = v => {
+    const s = String(v || '').trim();
+    if (!s) return '';
+    if (/^(Bạn|You|Chính bạn|Người dùng Facebook|Facebook|Messenger)$/i.test(s)) return s;
+    if (s.includes('•')) return s.split('•').map(p => maskName(p)).join(' • ');
+    const k = s.toLowerCase();
+    if (!nameMap.has(k)) nameMap.set(k, `Person#${nameMap.size + 1}`);
+    return nameMap.get(k);
+  };
+  const maskUrl = u => {
+    const s = String(u || '').trim();
+    if (!s) return '';
+    if (s.startsWith('data:')) return `[DATA_URL len=${s.length}]`;
+    if (s.startsWith('blob:')) return 'blob:[REDACTED]';
+    return '[REDACTED_MEDIA_URL]';
+  };
+  const maskText = t => {
+    if (typeof t !== 'string' || !t.trim()) return '';
+    return `[REDACTED_TEXT len=${t.trim().length}]`;
+  };
+  return {
+    ...rec,
+    senderId: maskUid(rec.senderId),
+    threadId: maskUid(rec.threadId),
+    personName: maskName(rec.personName),
+    threadName: maskName(rec.threadName),
+    senderName: maskName(rec.senderName),
+    personAliases: Array.isArray(rec.personAliases) ? rec.personAliases.map(maskName) : undefined,
+    avatarUrl: rec.avatarUrl ? maskUrl(rec.avatarUrl) : '',
+    text: maskText(rec.text),
+    anchorText: rec.anchorText ? maskText(rec.anchorText) : undefined,
+    editHistory: Array.isArray(rec.editHistory) ? rec.editHistory.map(maskText) : undefined,
+    attachments: Array.isArray(rec.attachments) ? rec.attachments.map(maskUrl) : []
+  };
+}
+
 function downloadFallbackDebugJson() {
   chrome.storage.local.get(
-    [STORAGE_KEY_UNSENT, STORAGE_KEY_MESSAGES, STORAGE_KEY_TOAST_ENABLED],
+    [STORAGE_KEY_UNSENT, STORAGE_KEY_MESSAGES, STORAGE_KEY_TOAST_ENABLED, STORAGE_KEY_DEBUG_ENABLED],
     function (res) {
       const unsent = Array.isArray(res[STORAGE_KEY_UNSENT]) ? res[STORAGE_KEY_UNSENT] : [];
       const captured = Array.isArray(res[STORAGE_KEY_MESSAGES]) ? res[STORAGE_KEY_MESSAGES] : [];
+      const nameMap = new Map();
+      const uidMap = new Map();
       const report = {
         exportedAt: new Date().toISOString(),
+        privacyNotice:
+          'Báo cáo này đã tự động ẩn danh nội dung tin nhắn, tên thật, UID và liên kết ảnh/video riêng tư để đăng lên GitHub Issues an toàn.',
         source:
           'popup-storage-fallback (không tìm thấy tab Facebook đang mở hoặc tab chưa tải lại trang)',
         version: chrome.runtime.getManifest().version,
         userAgent: navigator.userAgent,
         isToastEnabled: res[STORAGE_KEY_TOAST_ENABLED] !== false,
+        isDebugLoggingEnabled: res[STORAGE_KEY_DEBUG_ENABLED] === true,
         unsentCount: unsent.length,
         capturedCount: captured.length,
         contentWorld: {
-          unsentMessagesList: unsent,
-          recentMessagesListTail: captured.slice(-150)
+          unsentMessagesList: unsent.map(r => sanitizePopupDebugRecord(r, nameMap, uidMap)),
+          recentMessagesListTail: captured.slice(-80).map(r => sanitizePopupDebugRecord(r, nameMap, uidMap))
         }
       };
 
@@ -1779,6 +1837,22 @@ function closeDonateModal() {
   dom.donateBtn.focus();
 }
 
+// ── Hộp thoại chẩn đoán lỗi (Debug) ──
+function openDebugModal() {
+  if (!dom.debugModal) {
+    exportDebugReport();
+    return;
+  }
+  dom.debugModal.hidden = false;
+  if (dom.debugExportBtn) dom.debugExportBtn.focus();
+}
+
+function closeDebugModal() {
+  if (!dom.debugModal) return;
+  dom.debugModal.hidden = true;
+  if (dom.debugBtn) dom.debugBtn.focus();
+}
+
 function closeConfirmModal() {
   dom.confirmModal.hidden = true;
   if (appState.confirmMode === 'media' && dom.clearMediaBtn && !dom.clearMediaBtn.disabled) {
@@ -1898,7 +1972,50 @@ function bindEvents() {
 
   dom.exportBtn.addEventListener('click', exportBackupJson);
   if (dom.debugBtn) {
-    dom.debugBtn.addEventListener('click', exportDebugReport);
+    dom.debugBtn.addEventListener('click', openDebugModal);
+  }
+  if (dom.debugClose) {
+    dom.debugClose.addEventListener('click', closeDebugModal);
+  }
+  if (dom.debugCancelBtn) {
+    dom.debugCancelBtn.addEventListener('click', closeDebugModal);
+  }
+  if (dom.debugModal) {
+    dom.debugModal.addEventListener('click', function (e) {
+      if (e.target === dom.debugModal) {
+        closeDebugModal();
+      }
+    });
+  }
+  if (dom.debugExportBtn) {
+    dom.debugExportBtn.addEventListener('click', function () {
+      closeDebugModal();
+      exportDebugReport();
+    });
+  }
+  if (dom.debugModeToggle) {
+    dom.debugModeToggle.addEventListener('change', function () {
+      const enabled = dom.debugModeToggle.checked;
+      if (dom.debugBtn) dom.debugBtn.classList.toggle('is-active', enabled);
+      chrome.storage.local.set({ [STORAGE_KEY_DEBUG_ENABLED]: enabled }, function () {
+        if (chrome.tabs && typeof chrome.tabs.query === 'function') {
+          chrome.tabs.query({ url: '*://*.facebook.com/*' }, function (fbTabs) {
+            (fbTabs || []).forEach(function (t) {
+              if (t && t.id) {
+                chrome.tabs.sendMessage(t.id, { type: 'SET_DEBUG_LOGGING', enabled: enabled }, function () {
+                  void chrome.runtime?.lastError;
+                });
+              }
+            });
+          });
+        }
+        showStatus(
+          enabled
+            ? 'Đã BẬT ghi nhật ký gỡ lỗi (Debug Log)'
+            : 'Đã TẮT ghi nhật ký gỡ lỗi để tối ưu tốc độ'
+        );
+      });
+    });
   }
   if (dom.versionTag) {
     dom.versionTag.addEventListener('click', function () {
@@ -1977,6 +2094,9 @@ function bindEvents() {
     } else if (!dom.donateModal.hidden) {
       e.preventDefault();
       closeDonateModal();
+    } else if (dom.debugModal && !dom.debugModal.hidden) {
+      e.preventDefault();
+      closeDebugModal();
     } else if (!dom.lightbox.hidden) {
       e.preventDefault();
       closeLightbox();

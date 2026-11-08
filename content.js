@@ -10,14 +10,47 @@
   const STORAGE_KEY_UNSENT = 'fb_unsent_messages_v2';
   const STORAGE_KEY_CLEANED_FLAG = 'fb_unsend_schema_v4_cleaned';
   const STORAGE_KEY_TOAST_ENABLED = 'fb_unsend_toast_enabled';
+  const STORAGE_KEY_DEBUG_ENABLED = 'fb_unsend_debug_enabled';
   const STORAGE_KEY_ORPHANED_BRIDGE = 'fb_unsend_orphaned_bridge_v1';
+  const DEBUG_MODE_LOCAL_STORAGE_KEY = 'fb_unsend_debug_mode_v1';
   const MAX_STORED_MESSAGES = 3000;
 
   // Tùy chọn hiện thông báo ở góc màn hình (bật/tắt từ popup), mặc định bật
   let isToastEnabled = true;
 
+  // Chế độ ghi log chẩn đoán lỗi (Debug), mặc định TẮT để tối ưu hiệu năng
+  let isDebugLoggingEnabled = false;
+  try {
+    isDebugLoggingEnabled = window.localStorage.getItem(DEBUG_MODE_LOCAL_STORAGE_KEY) === 'true';
+  } catch (_) {}
+
   const MAX_LOG_ENTRIES = 600;
   const contentLogBuffer = [];
+
+  function setContentDebugMode(enabled) {
+    const next = Boolean(enabled);
+    isDebugLoggingEnabled = next;
+    if (!next) {
+      contentLogBuffer.length = 0;
+    }
+    try {
+      if (next) {
+        window.localStorage.setItem(DEBUG_MODE_LOCAL_STORAGE_KEY, 'true');
+      } else {
+        window.localStorage.removeItem(DEBUG_MODE_LOCAL_STORAGE_KEY);
+      }
+    } catch (_) {}
+    try {
+      window.postMessage(
+        {
+          source: 'FB_UNSEND_EXTENSION_CONTENT',
+          type: 'SET_DEBUG_LOGGING',
+          enabled: next
+        },
+        '*'
+      );
+    } catch (_) {}
+  }
 
   function serializeForLog(val, depth = 0) {
     if (val === null || val === undefined) return val;
@@ -53,6 +86,7 @@
   }
 
   function dlog(tag, _color, ...args) {
+    if (!isDebugLoggingEnabled) return;
     try {
       contentLogBuffer.push({
         t: new Date().toISOString(),
@@ -61,7 +95,7 @@
         data: args.map((a) => serializeForLog(a, 0))
       });
       if (contentLogBuffer.length > MAX_LOG_ENTRIES) {
-        contentLogBuffer.splice(0, contentLogBuffer.length - MAX_LOG_ENTRIES);
+        contentLogBuffer.splice(0, MAX_LOG_ENTRIES ? contentLogBuffer.length - MAX_LOG_ENTRIES : 0);
       }
     } catch (_) {}
   }
@@ -1245,10 +1279,17 @@
       chrome.storage.local.remove(['fb_captured_messages_v1', 'fb_unsent_messages_v1']);
 
       chrome.storage.local.get(
-        [STORAGE_KEY_MESSAGES, STORAGE_KEY_UNSENT, STORAGE_KEY_CLEANED_FLAG, STORAGE_KEY_TOAST_ENABLED],
+        [
+          STORAGE_KEY_MESSAGES,
+          STORAGE_KEY_UNSENT,
+          STORAGE_KEY_CLEANED_FLAG,
+          STORAGE_KEY_TOAST_ENABLED,
+          STORAGE_KEY_DEBUG_ENABLED
+        ],
         (res) => {
           if (!isExtensionContextValid() || !res) return;
           isToastEnabled = res[STORAGE_KEY_TOAST_ENABLED] !== false;
+          setContentDebugMode(res[STORAGE_KEY_DEBUG_ENABLED] === true);
           try {
             if (!res[STORAGE_KEY_CLEANED_FLAG]) {
               chrome.storage.local.set({
@@ -1286,14 +1327,20 @@
               ? [...res[STORAGE_KEY_MESSAGES]]
               : [];
             if (orphanedRecent.length > 0) {
+              const idxById = new Map();
+              rawStoredRecent.forEach((m, idx) => {
+                if (m && m.messageId) idxById.set(m.messageId, idx);
+              });
               for (const oMsg of orphanedRecent) {
                 if (!oMsg || typeof oMsg !== 'object') continue;
-                const existIdx = oMsg.messageId
-                  ? rawStoredRecent.findIndex((m) => m && m.messageId === oMsg.messageId)
-                  : -1;
+                const existIdx =
+                  oMsg.messageId && idxById.has(oMsg.messageId)
+                    ? idxById.get(oMsg.messageId)
+                    : -1;
                 if (existIdx !== -1) {
                   rawStoredRecent[existIdx] = { ...rawStoredRecent[existIdx], ...oMsg };
                 } else {
+                  if (oMsg.messageId) idxById.set(oMsg.messageId, rawStoredRecent.length);
                   rawStoredRecent.push(oMsg);
                 }
               }
@@ -1546,10 +1593,21 @@
     }
   }
 
+  const MAX_ORPHAN_RECENT_MESSAGES = 300;
+
   function saveOrphanedBridgeToLocalStorage() {
     try {
-      const cleanRecent = recentMessagesList.map(stripDomReferences).slice(-MAX_STORED_MESSAGES);
-      const cleanUnsent = unsentMessagesList.map(stripDomReferences);
+      const recentTail = recentMessagesList.slice(-MAX_ORPHAN_RECENT_MESSAGES).map((item) => {
+        const clean = stripDomReferences(item);
+        if (clean && Array.isArray(clean.attachments) && clean.attachments.some((u) => typeof u === 'string' && u.startsWith('data:'))) {
+          return {
+            ...clean,
+            attachments: clean.attachments.filter((u) => typeof u === 'string' && !u.startsWith('data:'))
+          };
+        }
+        return clean;
+      });
+      const cleanUnsent = unsentMessagesList.slice(0, 200).map(stripDomReferences);
       let existingRecent = [];
       let existingUnsent = [];
       try {
@@ -1561,30 +1619,35 @@
         }
       } catch (_) {}
 
-      const mergedUnsent = [...cleanUnsent];
-      for (const u of existingUnsent) {
-        if (u && u.messageId && !mergedUnsent.some((m) => m && m.messageId === u.messageId)) {
+      const unsentById = new Map();
+      const mergedUnsent = [];
+      for (const u of [...cleanUnsent, ...existingUnsent]) {
+        if (!u || typeof u !== 'object') continue;
+        if (u.messageId) {
+          if (!unsentById.has(u.messageId)) {
+            unsentById.set(u.messageId, u);
+            mergedUnsent.push(u);
+          }
+        } else {
           mergedUnsent.push(u);
         }
       }
 
-      const mergedRecent = [...existingRecent];
-      for (const r of cleanRecent) {
-        if (!r || !r.messageId) continue;
-        const idx = mergedRecent.findIndex((m) => m && m.messageId === r.messageId);
-        if (idx !== -1) {
-          mergedRecent[idx] = r;
-        } else {
-          mergedRecent.push(r);
-        }
+      const recentById = new Map();
+      for (const r of existingRecent) {
+        if (r && r.messageId) recentById.set(r.messageId, r);
       }
+      for (const r of recentTail) {
+        if (r && r.messageId) recentById.set(r.messageId, r);
+      }
+      const mergedRecent = Array.from(recentById.values()).slice(-MAX_ORPHAN_RECENT_MESSAGES);
 
       window.localStorage.setItem(
         STORAGE_KEY_ORPHANED_BRIDGE,
         JSON.stringify({
           savedAt: Date.now(),
           unsent: mergedUnsent.slice(0, 200),
-          recent: mergedRecent.slice(-MAX_STORED_MESSAGES)
+          recent: mergedRecent
         })
       );
       dlog('STORAGE-ORPHAN-BRIDGE-SAVED', '#fdcb6e', {
@@ -1595,6 +1658,9 @@
   }
 
   let saveTimeout = null;
+  let localSaveInFlightCount = 0;
+  let lastLocalSaveCompletedAt = 0;
+
   function saveToStorage() {
     if (!isExtensionContextValid()) {
       saveOrphanedBridgeToLocalStorage();
@@ -1614,12 +1680,15 @@
         const cleanUnsent = unsentMessagesList.map(stripDomReferences);
         recentMessagesList = cleanRecent;
         unsentMessagesList = cleanUnsent;
+        localSaveInFlightCount++;
         chrome.storage.local.set(
           {
             [STORAGE_KEY_MESSAGES]: cleanRecent,
             [STORAGE_KEY_UNSENT]: cleanUnsent
           },
           () => {
+            localSaveInFlightCount = Math.max(0, localSaveInFlightCount - 1);
+            lastLocalSaveCompletedAt = Date.now();
             if (chrome.runtime?.lastError) {
               dlog('STORAGE-ERROR', '#e84118', 'Lỗi khi lưu chrome.storage.local:', chrome.runtime.lastError);
               saveOrphanedBridgeToLocalStorage();
@@ -1632,6 +1701,7 @@
           }
         );
       } catch (err) {
+        localSaveInFlightCount = Math.max(0, localSaveInFlightCount - 1);
         dlog('STORAGE-EXCEPTION', '#e84118', 'Exception trong saveToStorage:', err);
         saveOrphanedBridgeToLocalStorage();
       }
@@ -1692,10 +1762,154 @@
     }
   }
 
+  function sanitizeDebugReportForGithub(rawReport) {
+    const nameMap = new Map();
+    const uidMap = new Map();
+    let nameCounter = 0;
+    let uidCounter = 0;
+
+    const maskUid = (val) => {
+      const s = String(val || '').trim();
+      if (!s) return '';
+      if (!uidMap.has(s)) {
+        uidCounter++;
+        uidMap.set(s, `UID#${uidCounter}`);
+      }
+      return uidMap.get(s);
+    };
+
+    const maskName = (val) => {
+      const s = String(val || '').trim();
+      if (!s) return '';
+      if (/^(Bạn|You|Chính bạn|Người dùng Facebook|Facebook|Messenger)$/i.test(s)) return s;
+      if (s.includes('•')) {
+        return s
+          .split('•')
+          .map((part) => maskName(part))
+          .join(' • ');
+      }
+      const key = s.toLowerCase();
+      if (!nameMap.has(key)) {
+        nameCounter++;
+        nameMap.set(key, `Person#${nameCounter}`);
+      }
+      return nameMap.get(key);
+    };
+
+    const maskMediaUrl = (urlStr) => {
+      const s = String(urlStr || '').trim();
+      if (!s) return '';
+      if (s.startsWith('data:')) {
+        const semiIdx = s.indexOf(';');
+        const mime = semiIdx !== -1 ? s.slice(5, semiIdx) : 'unknown';
+        return `[DATA_URL mime=${mime} len=${s.length}]`;
+      }
+      if (s.startsWith('blob:')) {
+        return 'blob:[REDACTED]';
+      }
+      try {
+        const u = new URL(s, location.origin);
+        const extMatch = u.pathname.match(/\.[a-z0-9]{2,5}$/i);
+        const ext = extMatch ? extMatch[0] : '';
+        return `${u.origin}/[REDACTED_PATH]${ext}${u.search ? '?[REDACTED_QUERY]' : ''}`;
+      } catch (_) {
+        return '[REDACTED_URL]';
+      }
+    };
+
+    const isSystemDiagnosticPhrase = (s) => {
+      return (
+        /thu hồi một tin nhắn|đã gỡ một tin nhắn|đã xóa một tin nhắn|unsent a message|removed a message|File đính kèm không được hỗ trợ|Unsupported attachment|Tin nhắn không hiển thị|Xem 1 lần|View once|Tin nhắn tự hủy|Đang hoạt động|Hoạt động .* trước|Active/i.test(
+          s
+        ) || s === '👍'
+      );
+    };
+
+    const maskTextContent = (textVal) => {
+      if (typeof textVal !== 'string') return textVal;
+      const trimmed = textVal.trim();
+      if (!trimmed) return '';
+      if (isSystemDiagnosticPhrase(trimmed)) {
+        return trimmed.replace(/^(.+?)\s+(đã\s+(?:thu hồi|gỡ|xóa)\s+một\s+tin\s+nhắn)/i, (_m, who, rest) => {
+          return `${maskName(who)} ${rest}`;
+        });
+      }
+      return `[REDACTED_TEXT len=${trimmed.length}]`;
+    };
+
+    const maskMsgId = (idVal) => {
+      if (typeof idVal !== 'string') return idVal;
+      return idVal.replace(/^(\d{6,25})(@(?:msgr|g\.us))/, (_m, uid, domain) => `${maskUid(uid)}${domain}`);
+    };
+
+    const sanitizeValue = (val, keyName = '', depth = 0) => {
+      if (val === null || val === undefined) return val;
+      if (depth > 8) return '[MaxDepth]';
+
+      if (typeof val === 'string') {
+        const lowerKey = String(keyName || '').toLowerCase();
+        if (lowerKey === 'url' && val.includes('facebook.com')) {
+          return val.replace(/\/(t|e2ee\/t)\/[^/?#]+/i, '/$1/[REDACTED_THREAD_ID]');
+        }
+        if (/avatar|poster|thumb|mediaurl|finalurl/i.test(lowerKey) || /^(https?:|data:|blob:)/i.test(val)) {
+          return maskMediaUrl(val);
+        }
+        if (/^(senderid|threadid|currentuserid|contactid|userid|authorid)$/i.test(lowerKey)) {
+          return maskUid(val);
+        }
+        if (/^(sendername|personname|threadname|rowsendername|currentuserfullname|nickname)$/i.test(lowerKey)) {
+          return maskName(val);
+        }
+        if (/^(messageid|originalmessageid|revokemessageid|fibermsgid|msgid|fbmsgid)$/i.test(lowerKey)) {
+          return maskMsgId(val);
+        }
+        if (/^(text|rawtext|rawrowtext|anchortext|unsendnotice|noticeeltext|bodypreview|decodedtext)$/i.test(lowerKey)) {
+          return maskTextContent(val);
+        }
+        if (/^\d{6,25}@(?:msgr|g\.us)\.\d+$/.test(val)) {
+          return maskMsgId(val);
+        }
+        return val;
+      }
+
+      if (Array.isArray(val)) {
+        const lowerKey = String(keyName || '').toLowerCase();
+        if (lowerKey === 'attachments' || lowerKey === 'fibermediaurls') {
+          return val.map((item) => maskMediaUrl(item));
+        }
+        if (lowerKey === 'personaliases') {
+          return val.map((item) => maskName(item));
+        }
+        if (lowerKey === 'edithistory') {
+          return val.map((item) => maskTextContent(item));
+        }
+        if ((lowerKey === 'contactnamemap' || lowerKey === 'threadnamemap') && val.length === 2 && typeof val[0] === 'string') {
+          return [maskUid(val[0]), maskName(val[1])];
+        }
+        return val.map((item) => sanitizeValue(item, keyName, depth + 1));
+      }
+
+      if (typeof val === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(val)) {
+          out[k] = sanitizeValue(v, k, depth + 1);
+        }
+        return out;
+      }
+
+      return val;
+    };
+
+    return sanitizeValue(rawReport, '', 0);
+  }
+
   function downloadDebugReport(mainDump = {}) {
     try {
-      const report = {
+      const rawReport = {
         exportedAt: new Date().toISOString(),
+        privacyNotice:
+          'Báo cáo này đã tự động ẩn danh nội dung tin nhắn, tên thật, UID và liên kết ảnh/video riêng tư để đăng lên GitHub Issues an toàn.',
+        isDebugLoggingEnabled,
         url: location.href,
         userAgent: navigator.userAgent,
         identity: {
@@ -1707,13 +1921,14 @@
         contentWorld: {
           contentLogs: contentLogBuffer,
           unsentMessagesList: unsentMessagesList.map((m) => serializeForLog(m, 0)),
-          recentMessagesListTail: recentMessagesList.slice(-120).map((m) => serializeForLog(m, 0)),
+          recentMessagesListTail: recentMessagesList.slice(-80).map((m) => serializeForLog(m, 0)),
           recentlyDisappearedMessages: recentlyDisappearedMessages.map((m) => serializeForLog(m, 0)),
           domChatRowsSnapshot: buildDomChatRowsSnapshot()
         }
       };
 
-      const jsonStr = JSON.stringify(report, null, 2);
+      const safeReport = sanitizeDebugReportForGithub(rawReport);
+      const jsonStr = JSON.stringify(safeReport, null, 2);
       const blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8' });
       const blobUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -1765,6 +1980,11 @@
         if (msg && msg.type === 'TRIGGER_DEBUG_EXPORT') {
           triggerDebugExport();
           sendResponse({ ok: true, url: location.href });
+          return true;
+        }
+        if (msg && msg.type === 'SET_DEBUG_LOGGING') {
+          setContentDebugMode(Boolean(msg.enabled));
+          sendResponse({ ok: true, enabled: isDebugLoggingEnabled });
           return true;
         }
       });
@@ -5984,6 +6204,14 @@
         try {
           if (changes[STORAGE_KEY_TOAST_ENABLED]) {
             isToastEnabled = changes[STORAGE_KEY_TOAST_ENABLED].newValue !== false;
+          }
+          if (changes[STORAGE_KEY_DEBUG_ENABLED]) {
+            setContentDebugMode(changes[STORAGE_KEY_DEBUG_ENABLED].newValue === true);
+          }
+          const isSelfSaveEvent =
+            localSaveInFlightCount > 0 || Date.now() - lastLocalSaveCompletedAt < 250;
+          if (isSelfSaveEvent) {
+            return;
           }
           let updated = false;
           if (changes[STORAGE_KEY_MESSAGES]?.newValue) {

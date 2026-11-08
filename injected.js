@@ -10,6 +10,12 @@
   if (window.__FB_UNSEND_INJECTED__) return;
   window.__FB_UNSEND_INJECTED__ = true;
 
+  const DEBUG_MODE_STORAGE_KEY = 'fb_unsend_debug_mode_v1';
+  let isDebugLoggingEnabled = false;
+  try {
+    isDebugLoggingEnabled = window.localStorage.getItem(DEBUG_MODE_STORAGE_KEY) === 'true';
+  } catch (_) {}
+
   const MAX_LOG_ENTRIES = 600;
   const mainLogBuffer = [];
 
@@ -47,6 +53,7 @@
   }
 
   function dlog(tag, _color, ...args) {
+    if (!isDebugLoggingEnabled) return;
     try {
       mainLogBuffer.push({
         t: new Date().toISOString(),
@@ -205,6 +212,7 @@
   }
 
   async function probeUnsupportedMessageData(info) {
+    if (!isDebugLoggingEnabled) return;
     const { messageId, otid, threadId, senderId } = info || {};
     const probeKey = messageId || otid || 'unknown';
     if (probedMessageIds.has(probeKey)) return;
@@ -1634,11 +1642,13 @@
       return;
     }
 
-    const isNoisyDeleteRequest =
-      /^LSDeleteMessageRequest(\.|$)/i.test(moduleName) &&
-      !args.some((a) => typeof a === 'string' && unvaultString(a).includes('mid.$'));
-    if (!isNoisyDeleteRequest) {
-      dlog('PROC', '#9c88ff', moduleName, { args, returnValue });
+    if (isDebugLoggingEnabled) {
+      const isNoisyDeleteRequest =
+        /^LSDeleteMessageRequest(\.|$)/i.test(moduleName) &&
+        !args.some((a) => typeof a === 'string' && unvaultString(a).includes('mid.$'));
+      if (!isNoisyDeleteRequest) {
+        dlog('PROC', '#9c88ff', moduleName, { args, returnValue });
+      }
     }
 
     if (/^MpsRavenToBridge\.(processRavenAttachment|ravenToBridge)$/i.test(moduleName)) {
@@ -1647,7 +1657,7 @@
         const msgWrapper = arg0?.message || arg0;
         const suppMap = arg0?.supplementalMessages || null;
         const ravenInfo = decodeRavenFromProtobufWrapper(msgWrapper, suppMap);
-        if (ravenInfo) {
+        if (ravenInfo && isDebugLoggingEnabled) {
           deepUnsupportedInspector.e2eeRavenExtracted.push({
             t: new Date().toISOString(),
             source: moduleName,
@@ -2018,18 +2028,20 @@
       return origFn;
     }
 
-    try {
-      if (
-        /Attachment|Ephemeral|ViewOnce|Unsupported|LightspeedRequest|SyncParams|Capabilit/i.test(
-          label
-        ) &&
-        !deepUnsupportedInspector.moduleSources[label]
-      ) {
-        deepUnsupportedInspector.moduleSources[label] = Function.prototype.toString
-          .call(origFn)
-          .slice(0, 5000);
-      }
-    } catch (_) {}
+    if (isDebugLoggingEnabled) {
+      try {
+        if (
+          /Attachment|Ephemeral|ViewOnce|Unsupported|LightspeedRequest|SyncParams|Capabilit/i.test(
+            label
+          ) &&
+          !deepUnsupportedInspector.moduleSources[label]
+        ) {
+          deepUnsupportedInspector.moduleSources[label] = Function.prototype.toString
+            .call(origFn)
+            .slice(0, 5000);
+        }
+      } catch (_) {}
+    }
 
     const wrapped = function () {
       const args = Array.from(arguments);
@@ -2040,35 +2052,26 @@
             recordVaultMapping(args[0], ret);
           }
         } else {
-          deepUnsupportedInspector.recentLsProcedureRing.push({
-            t: Date.now(),
-            mod: label,
-            args: serializeUntruncated(args, 0)
-          });
-          if (deepUnsupportedInspector.recentLsProcedureRing.length > 80) {
-            deepUnsupportedInspector.recentLsProcedureRing.shift();
-          }
-
-          const hasUnsupportedMarker = args.some(
-            (a) =>
-              typeof a === 'string' &&
-              (a === 'unavailable' ||
-                a.startsWith('unsupportedmid.$') ||
-                /File đính kèm không được hỗ trợ|Tin nhắn không hiển thị/i.test(a))
-          );
-          if (hasUnsupportedMarker || /^LSInsertAttachment(\.|$)/i.test(label)) {
-            const stackStr = new Error().stack || '';
-            deepUnsupportedInspector.unsupportedCallSnapshots.push({
-              t: new Date().toISOString(),
-              mod: label,
-              fullArgs: serializeUntruncated(args, 0),
-              returnValue: serializeUntruncated(ret, 0),
-              stack: stackStr,
-              fnSource: Function.prototype.toString.call(origFn).slice(0, 5000),
-              precedingLsCalls: deepUnsupportedInspector.recentLsProcedureRing.slice(-35)
-            });
-            if (deepUnsupportedInspector.unsupportedCallSnapshots.length > 15) {
-              deepUnsupportedInspector.unsupportedCallSnapshots.shift();
+          if (isDebugLoggingEnabled) {
+            const hasUnsupportedMarker = args.some(
+              (a) =>
+                typeof a === 'string' &&
+                (a === 'unavailable' ||
+                  a.startsWith('unsupportedmid.$') ||
+                  /File đính kèm không được hỗ trợ|Tin nhắn không hiển thị/i.test(a))
+            );
+            if (hasUnsupportedMarker || /^LSInsertAttachment(\.|$)/i.test(label)) {
+              const stackStr = new Error().stack || '';
+              deepUnsupportedInspector.unsupportedCallSnapshots.push({
+                t: new Date().toISOString(),
+                mod: label,
+                fullArgs: serializeForLog(args, 0),
+                returnValue: serializeForLog(ret, 0),
+                stack: stackStr
+              });
+              if (deepUnsupportedInspector.unsupportedCallSnapshots.length > 15) {
+                deepUnsupportedInspector.unsupportedCallSnapshots.shift();
+              }
             }
           }
 
@@ -2398,14 +2401,18 @@
             suppRaven = rMsg;
           }
           if (rNotif) suppNotif = rNotif;
-          suppDecoded.push({
-            key: String(suppKey),
-            contentKeys: cont ? Object.keys(cont) : [],
-            raven: serializeUntruncated(rMsg, 0),
-            notif: serializeUntruncated(rNotif, 0)
-          });
+          if (isDebugLoggingEnabled) {
+            suppDecoded.push({
+              key: String(suppKey),
+              contentKeys: cont ? Object.keys(cont) : [],
+              raven: serializeForLog(rMsg, 0),
+              notif: serializeForLog(rNotif, 0)
+            });
+          }
         } catch (err) {
-          suppDecoded.push({ key: String(suppKey), error: String(err) });
+          if (isDebugLoggingEnabled) {
+            suppDecoded.push({ key: String(suppKey), error: String(err) });
+          }
         }
       }
 
@@ -2535,17 +2542,21 @@
         resolveFullViewOnceMedia(fullMsgId, tIntegral, tAncillary, thumbObj, isVideo, meta);
       }
 
+      if (!isDebugLoggingEnabled) {
+        return { msgId: fullMsgId };
+      }
+
       return {
         t: new Date().toISOString(),
         msgId: fullMsgId,
         threadId,
         senderId,
         topContentKeys: topContent ? Object.keys(topContent) : [],
-        topRaven: serializeUntruncated(topRaven, 0),
+        topRaven: serializeForLog(topRaven, 0),
         suppDecoded,
-        decodedImageTransport: serializeUntruncated(decodedImageTransport, 0),
-        decodedVideoTransport: serializeUntruncated(decodedVideoTransport, 0),
-        bridgeMediaPreview: serializeUntruncated(bridgeMediaPreview, 0)
+        decodedImageTransport: serializeForLog(decodedImageTransport, 0),
+        decodedVideoTransport: serializeForLog(decodedVideoTransport, 0),
+        bridgeMediaPreview: serializeForLog(bridgeMediaPreview, 0)
       };
     } catch (e) {
       return { error: String(e) };
@@ -2766,104 +2777,113 @@
         }
       }
 
-      deepUnsupportedInspector.e2eeRavenExtracted.push({
-        t: new Date().toISOString(),
-        source: 'mpsOverBridgeProbe',
-        fullMsgId,
-        threadId,
-        stanzaId,
-        singleResSuccess: singleRes?.success,
-        singleResKeys: singleRes?.value ? Object.keys(singleRes.value) : null,
-        listResSuccess: listRes?.success,
-        listCount: listRes?.value?.messages?.length ?? 0,
-        extractedItems,
-        rawSingleSample: serializeUntruncated(singleRes, 0)
-      });
-      if (deepUnsupportedInspector.e2eeRavenExtracted.length > 25) {
-        deepUnsupportedInspector.e2eeRavenExtracted.shift();
+      if (isDebugLoggingEnabled) {
+        deepUnsupportedInspector.e2eeRavenExtracted.push({
+          t: new Date().toISOString(),
+          source: 'mpsOverBridgeProbe',
+          fullMsgId,
+          threadId,
+          stanzaId,
+          singleResSuccess: singleRes?.success,
+          singleResKeys: singleRes?.value ? Object.keys(singleRes.value) : null,
+          listResSuccess: listRes?.success,
+          listCount: listRes?.value?.messages?.length ?? 0,
+          extractedItems
+        });
+        if (deepUnsupportedInspector.e2eeRavenExtracted.length > 25) {
+          deepUnsupportedInspector.e2eeRavenExtracted.shift();
+        }
       }
     } catch (e) {
-      deepUnsupportedInspector.e2eeRavenExtracted.push({
-        t: new Date().toISOString(),
-        source: 'mpsOverBridgeProbeError',
-        fullMsgId,
-        error: String(e)
-      });
+      if (isDebugLoggingEnabled) {
+        deepUnsupportedInspector.e2eeRavenExtracted.push({
+          t: new Date().toISOString(),
+          source: 'mpsOverBridgeProbeError',
+          fullMsgId,
+          error: String(e)
+        });
+      }
     }
   }
+
+  const FAST_MODULE_PREFIX_REGEX = /^(?:LS|MAW|Mps|WA|ReQL|decodeProtobuf)/i;
 
   let currentDefFunc = window.__d;
   function wrapDefineFn(origD) {
     if (!origD || origD.__fbUnsendWrapped) return origD;
     const wrappedD = function (moduleName, deps, factory, _extra) {
       if (typeof moduleName === 'string') {
-        if (
-          INTERESTING_MODULE_NAME_REGEX.test(moduleName) &&
-          !interestingModuleSet.has(moduleName)
-        ) {
-          interestingModuleSet.add(moduleName);
-          if (deepUnsupportedInspector.interestingModuleNames.length < 1000) {
-            deepUnsupportedInspector.interestingModuleNames.push(moduleName);
+        if (isDebugLoggingEnabled) {
+          if (
+            INTERESTING_MODULE_NAME_REGEX.test(moduleName) &&
+            !interestingModuleSet.has(moduleName)
+          ) {
+            interestingModuleSet.add(moduleName);
+            if (deepUnsupportedInspector.interestingModuleNames.length < 1000) {
+              deepUnsupportedInspector.interestingModuleNames.push(moduleName);
+            }
+          }
+
+          if (
+            typeof factory === 'function' &&
+            SOURCE_CAPTURE_MODULE_REGEX.test(moduleName) &&
+            !deepUnsupportedInspector.moduleSources[moduleName]
+          ) {
+            try {
+              deepUnsupportedInspector.moduleSources[moduleName] = {
+                deps: Array.isArray(deps) ? deps : [],
+                code: Function.prototype.toString.call(factory).slice(0, 12000)
+              };
+            } catch (_) {}
           }
         }
 
-        if (
-          typeof factory === 'function' &&
-          SOURCE_CAPTURE_MODULE_REGEX.test(moduleName) &&
-          !deepUnsupportedInspector.moduleSources[moduleName]
-        ) {
-          try {
-            deepUnsupportedInspector.moduleSources[moduleName] = {
-              deps: Array.isArray(deps) ? deps : [],
-              code: Function.prototype.toString.call(factory).slice(0, 12000)
-            };
-          } catch (_) {}
-        }
+        if (typeof factory === 'function' && FAST_MODULE_PREFIX_REGEX.test(moduleName)) {
+          const shouldSafeWrap = SAFE_TARGET_MODULE_REGEX.test(moduleName);
+          const shouldPassiveCapture = PASSIVE_EXPORT_CAPTURE_REGEX.test(moduleName);
 
-        const shouldSafeWrap = SAFE_TARGET_MODULE_REGEX.test(moduleName);
-        const shouldPassiveCapture = PASSIVE_EXPORT_CAPTURE_REGEX.test(moduleName);
-
-        if (typeof factory === 'function' && (shouldSafeWrap || shouldPassiveCapture)) {
-          const origFactory = factory;
-          factory = function (g, r, i, a, m, e, d) {
-            if (!fbRequireFn && typeof i === 'function') {
-              fbRequireFn = i;
-            }
-            if (!fbImportNamespaceFn && typeof a === 'function') {
-              fbImportNamespaceFn = a;
-            }
-            const ret = origFactory.apply(this, arguments);
-            try {
-              const hasD = d && typeof d === 'object' && Object.keys(d).length > 0;
-              const hasM =
-                m &&
-                m.exports !== undefined &&
-                m.exports !== null &&
-                (typeof m.exports !== 'object' || Object.keys(m.exports).length > 0);
-              const hasE = e && typeof e === 'object' && Object.keys(e).length > 0;
-              const exp = hasD ? d : hasM ? m.exports : hasE ? e : d || (m && m.exports) || e;
-
-              if (exp && shouldPassiveCapture) {
-                passiveModuleExports.set(moduleName, exp);
+          if (shouldSafeWrap || shouldPassiveCapture) {
+            const origFactory = factory;
+            factory = function (g, r, i, a, m, e, d) {
+              if (!fbRequireFn && typeof i === 'function') {
+                fbRequireFn = i;
               }
-              if (shouldSafeWrap) {
-                if (hasD) {
-                  instrumentFacebookModule(moduleName, d);
-                } else if (hasM) {
-                  m.exports = instrumentFacebookModule(moduleName, m.exports);
-                } else if (hasE) {
-                  instrumentFacebookModule(moduleName, e);
+              if (!fbImportNamespaceFn && typeof a === 'function') {
+                fbImportNamespaceFn = a;
+              }
+              const ret = origFactory.apply(this, arguments);
+              try {
+                const hasD = d && typeof d === 'object' && Object.keys(d).length > 0;
+                const hasM =
+                  m &&
+                  m.exports !== undefined &&
+                  m.exports !== null &&
+                  (typeof m.exports !== 'object' || Object.keys(m.exports).length > 0);
+                const hasE = e && typeof e === 'object' && Object.keys(e).length > 0;
+                const exp = hasD ? d : hasM ? m.exports : hasE ? e : d || (m && m.exports) || e;
+
+                if (exp && shouldPassiveCapture) {
+                  passiveModuleExports.set(moduleName, exp);
                 }
-              }
+                if (shouldSafeWrap) {
+                  if (hasD) {
+                    instrumentFacebookModule(moduleName, d);
+                  } else if (hasM) {
+                    m.exports = instrumentFacebookModule(moduleName, m.exports);
+                  } else if (hasE) {
+                    instrumentFacebookModule(moduleName, e);
+                  }
+                }
+              } catch (_) {}
+              return ret;
+            };
+            try {
+              Object.defineProperty(factory, 'length', {
+                value: origFactory.length,
+                configurable: true
+              });
             } catch (_) {}
-            return ret;
-          };
-          try {
-            Object.defineProperty(factory, 'length', {
-              value: origFactory.length,
-              configurable: true
-            });
-          } catch (_) {}
+          }
         }
       }
       return origD.apply(this, arguments);
@@ -3416,6 +3436,9 @@
     }
   }
 
+  const WS_FRAME_CAPTURE_REGEX =
+    /mid\.\$|wmid\.|upsertMessage|insertMessage|deleteThenInsertMessage|editMessage|replaceMessageText|insertMessageEditHistory|markMessageUnsent/;
+
   function handleWebSocketFrame(data, wsUrl = '') {
     try {
       let decoded = '';
@@ -3434,7 +3457,9 @@
         return;
       }
 
-      if (decoded) {
+      if (!decoded) return;
+
+      if (isDebugLoggingEnabled) {
         const isAfterInit = Date.now() - PAGE_LOAD_TIME > INITIAL_SYNC_GRACE_MS;
         const hasUnsupportedOrAttachment =
           decoded.includes('unsupported') ||
@@ -3453,127 +3478,18 @@
             t: new Date().toISOString(),
             ms: Date.now(),
             byteLen,
-            decodedText: decoded.slice(0, 25000)
+            decodedText: decoded.slice(0, 4000)
           });
-          if (deepUnsupportedInspector.wsReceivedRawFrames.length > 35) {
+          if (deepUnsupportedInspector.wsReceivedRawFrames.length > 20) {
             deepUnsupportedInspector.wsReceivedRawFrames.shift();
           }
         }
       }
 
-      if (
-        decoded &&
-        (decoded.includes('mid.$') ||
-          decoded.includes('wmid.') ||
-          decoded.includes('upsertMessage') ||
-          decoded.includes('insertMessage') ||
-          decoded.includes('deleteThenInsertMessage') ||
-          decoded.includes('editMessage') ||
-          decoded.includes('replaceMessageText') ||
-          decoded.includes('insertMessageEditHistory') ||
-          decoded.includes('markMessageUnsent') ||
-          isUnsendNoticeText(decoded))
-      ) {
+      if (WS_FRAME_CAPTURE_REGEX.test(decoded) || isUnsendNoticeText(decoded)) {
         extractJsonObjectsFromString(decoded);
       }
     } catch (_) {}
-  }
-
-  const origWsSend = OriginalWebSocket.prototype.send;
-  OriginalWebSocket.prototype.send = function (data) {
-    try {
-      let decoded = '';
-      let byteLen = 0;
-      if (typeof data === 'string') {
-        decoded = data;
-        byteLen = data.length;
-      } else if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
-        byteLen = data.byteLength || 0;
-        decoded = safeDecodeBuffer(data);
-      }
-      if (decoded) {
-        deepUnsupportedInspector.wsSentFrames.push({
-          t: new Date().toISOString(),
-          url: this.url || '',
-          byteLen,
-          decodedText: decoded.slice(0, 15000)
-        });
-        if (deepUnsupportedInspector.wsSentFrames.length > 40) {
-          deepUnsupportedInspector.wsSentFrames.shift();
-        }
-      }
-    } catch (_) {}
-    if (this.readyState === 2 || this.readyState === 3) {
-      return;
-    }
-    return origWsSend.apply(this, arguments);
-  };
-
-  if (window.XMLHttpRequest) {
-    const origXhrOpen = XMLHttpRequest.prototype.open;
-    const origXhrSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function (method, url) {
-      this.__fbUnsendUrl = String(url || '');
-      this.__fbUnsendMethod = String(method || '');
-      return origXhrOpen.apply(this, arguments);
-    };
-    XMLHttpRequest.prototype.send = function (body) {
-      try {
-        const url = this.__fbUnsendUrl || '';
-        const bodyStr = typeof body === 'string' ? body : '';
-        if (
-          bodyStr &&
-          (bodyStr.includes('LSPlatform') ||
-            bodyStr.includes('sync_params') ||
-            bodyStr.includes('request_payload') ||
-            bodyStr.includes('lightspeed'))
-        ) {
-          let decodedBody = bodyStr;
-          try {
-            decodedBody = decodeURIComponent(bodyStr);
-          } catch (_) {}
-          deepUnsupportedInspector.graphqlSyncRequests.push({
-            t: new Date().toISOString(),
-            url,
-            body: decodedBody.slice(0, 15000)
-          });
-          if (deepUnsupportedInspector.graphqlSyncRequests.length > 25) {
-            deepUnsupportedInspector.graphqlSyncRequests.shift();
-          }
-        }
-        this.addEventListener('load', function () {
-          try {
-            if (
-              (!this.responseType || this.responseType === 'text') &&
-              typeof this.responseText === 'string'
-            ) {
-              const rt = this.responseText;
-              if (
-                rt.includes('unsupportedmid.$') ||
-                rt.includes('File đính kèm không được hỗ trợ') ||
-                rt.includes('insertAttachment')
-              ) {
-                const idx =
-                  rt.indexOf('unsupportedmid.$') !== -1
-                    ? rt.indexOf('unsupportedmid.$')
-                    : rt.indexOf('insertAttachment');
-                const start = Math.max(0, idx - 1500);
-                deepUnsupportedInspector.graphqlInterestingResponses.push({
-                  t: new Date().toISOString(),
-                  url,
-                  totalLen: rt.length,
-                  excerpt: rt.slice(start, start + 12000)
-                });
-                if (deepUnsupportedInspector.graphqlInterestingResponses.length > 20) {
-                  deepUnsupportedInspector.graphqlInterestingResponses.shift();
-                }
-              }
-            }
-          } catch (_) {}
-        });
-      } catch (_) {}
-      return origXhrSend.apply(this, arguments);
-    };
   }
 
   window.WebSocket = function (url, protocols) {
@@ -3608,6 +3524,8 @@
   window.WebSocket.prototype = OriginalWebSocket.prototype;
   Object.assign(window.WebSocket, OriginalWebSocket);
 
+  const IDB_RELEVANT_STORE_REGEX = /message|thread|attachment|participant|contact|rms|maw/i;
+
   if (window.IDBObjectStore) {
     const origPut = IDBObjectStore.prototype.put;
     const origAdd = IDBObjectStore.prototype.add;
@@ -3615,7 +3533,7 @@
     IDBObjectStore.prototype.put = function (value, key) {
       const storeName = this.name || 'unknown';
       try {
-        if (value && typeof value === 'object') {
+        if (value && typeof value === 'object' && IDB_RELEVANT_STORE_REGEX.test(storeName)) {
           queueMicrotask(() => {
             try {
               inspectPlainObject(value, 0, {
@@ -3633,7 +3551,7 @@
     IDBObjectStore.prototype.add = function (value, key) {
       const storeName = this.name || 'unknown';
       try {
-        if (value && typeof value === 'object') {
+        if (value && typeof value === 'object' && IDB_RELEVANT_STORE_REGEX.test(storeName)) {
           queueMicrotask(() => {
             try {
               inspectPlainObject(value, 0, {
@@ -4064,88 +3982,38 @@
     if (event.data.source === 'FB_UNSEND_EXTENSION_CONTENT') {
       if (event.data.type === 'SCAN_FIBER') {
         scanReactFiberOnChatRows();
+      } else if (event.data.type === 'SET_DEBUG_LOGGING') {
+        isDebugLoggingEnabled = Boolean(event.data.enabled);
+        try {
+          if (isDebugLoggingEnabled) {
+            window.localStorage.setItem(DEBUG_MODE_STORAGE_KEY, 'true');
+            dlog('DEBUG-MODE', '#00b894', 'Đã BẬT chế độ ghi log chẩn đoán lỗi (Debug)');
+          } else {
+            window.localStorage.removeItem(DEBUG_MODE_STORAGE_KEY);
+            mainLogBuffer.length = 0;
+            deepUnsupportedInspector.wsReceivedRawFrames.length = 0;
+            deepUnsupportedInspector.recentLsProcedureRing.length = 0;
+            deepUnsupportedInspector.unsupportedCallSnapshots.length = 0;
+            deepUnsupportedInspector.activeProbes.length = 0;
+            deepUnsupportedInspector.e2eeRavenExtracted.length = 0;
+            deepUnsupportedInspector.moduleSources = {};
+          }
+        } catch (_) {}
       } else if (event.data.type === 'REQUEST_MAIN_DEBUG_DUMP') {
         scanReactFiberOnChatRows();
-        try {
-          const syncParamsMod = getFbModule('LSPlatformMessengerSyncParams');
-          const lsVersionMod = getFbModule('LSVersion');
-          const threadCapMod = getFbModule('MWLSThreadCapabilities');
-          const partCapMod = getFbModule('LSComputeParticipantCapabilities');
-          const targetInspectMods = [
-            'LSIssueAttachmentRestoreTask',
-            'LSUpsertAttachmentRange',
-            'LSUpsertAttachmentRangeStoredProcedure',
-            'LSIssueFetchThreadCapabilitiesTask',
-            'LSTaskSerializerSyncThreadCapabilities',
-            'MessengerAttachmentTransformer.bs',
-            'MessengerStoryAttachmentTransformer.bs',
-            'LSInsertAttachment',
-            'LSInsertBlobAttachment',
-            'LSInsertXmaAttachment',
-            'LSMediaUrlAttachment',
-            'LSPlatformClientSingleton',
-            'LSDatabaseSingleton'
-          ];
-          for (const mName of deepUnsupportedInspector.interestingModuleNames) {
-            if (
-              /Restore|UpsertAttachment|Capability|SyncTask|Transformer|Ephemeral|ViewOnce|Unsupported/i.test(
-                mName
-              ) &&
-              !targetInspectMods.includes(mName)
-            ) {
-              targetInspectMods.push(mName);
-            }
-          }
-          const restoreAndAttachmentModules = {};
-          for (const mName of targetInspectMods) {
-            try {
-              const mod = getFbModule(mName);
-              if (!mod) continue;
-              if (typeof mod === 'function') {
-                restoreAndAttachmentModules[mName] = {
-                  type: 'function',
-                  sprocName: mod.__sproc_name__ || null,
-                  tables: mod.__tables__ || null,
-                  source: Function.prototype.toString.call(mod).slice(0, 12000)
-                };
-              } else if (typeof mod === 'object') {
-                const objInfo = {};
-                for (const k of Object.keys(mod).slice(0, 30)) {
-                  const v = mod[k];
-                  objInfo[k] =
-                    typeof v === 'function'
-                      ? Function.prototype.toString.call(v).slice(0, 6000)
-                      : serializeUntruncated(v, 1);
-                }
-                restoreAndAttachmentModules[mName] = {
-                  type: 'object',
-                  keys: Object.keys(mod),
-                  objInfo
-                };
-              }
-            } catch (_) {}
-          }
-          deepUnsupportedInspector.syncParamsInspect = {
-            syncParams: serializeUntruncated(syncParamsMod, 0),
-            lsVersion: serializeUntruncated(lsVersionMod, 0),
-            threadCap: serializeUntruncated(threadCapMod, 0),
-            partCap: serializeUntruncated(partCapMod, 0),
-            restoreAndAttachmentModules
-          };
-        } catch (_) {}
         emitToContentScript('FB_MAIN_DEBUG_DUMP', {
+          isDebugLoggingEnabled,
           mainLogs: mainLogBuffer,
-          capturedMessages: Array.from(capturedMessages.values()).slice(-200).map((m) => serializeForLog(m, 0)),
-          messageMetaMap: Array.from(messageMetaMap.entries()).slice(-200),
-          pendingVaultMessages: Array.from(pendingVaultMessages.entries()).slice(-50).map(([k, v]) => [k, serializeForLog(v, 0)]),
-          aliasIdMap: Array.from(aliasIdMap.entries()).slice(-200),
-          contactNameMap: Array.from(contactNameMap.entries()).slice(-100),
-          threadNameMap: Array.from(threadNameMap.entries()).slice(-100),
+          capturedMessages: Array.from(capturedMessages.values()).slice(-120).map((m) => serializeForLog(m, 0)),
+          messageMetaMap: Array.from(messageMetaMap.entries()).slice(-120),
+          pendingVaultMessages: Array.from(pendingVaultMessages.entries()).slice(-40).map(([k, v]) => [k, serializeForLog(v, 0)]),
+          aliasIdMap: Array.from(aliasIdMap.entries()).slice(-120),
+          contactNameMap: Array.from(contactNameMap.entries()).slice(-80),
+          threadNameMap: Array.from(threadNameMap.entries()).slice(-80),
           vaultMapSize: vaultMap.size,
-          vaultMapSample: Array.from(vaultMap.entries()).slice(-100),
           hasMawUnvaultFn: Boolean(mawUnvaultFn),
           fiberRowsInspect: buildUnsupportedAndRecentFiberDump(),
-          deepUnsupportedInspector
+          deepUnsupportedInspector: isDebugLoggingEnabled ? deepUnsupportedInspector : undefined
         });
       }
     }

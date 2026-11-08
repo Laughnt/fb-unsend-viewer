@@ -176,7 +176,7 @@
         <span class="footer-sep" aria-hidden="true">•</span>
         <button type="button" id="version-tag" class="version-tag" title="Nhấn để kiểm tra bản cập nhật mới trên GitHub Releases"></button>
         <span class="footer-sep" aria-hidden="true">•</span>
-        <button type="button" id="debug-btn" class="debug-link-btn" title="Tải tệp chẩn đoán lỗi (Debug JSON — hoặc nhấn Alt+Shift+D trên tab Facebook)" aria-label="Tải tệp Debug">
+        <button type="button" id="debug-btn" class="debug-link-btn" title="Cài đặt & tải tệp chẩn đoán lỗi (Debug JSON — hoặc nhấn Alt+Shift+D trên tab Facebook)" aria-label="Chẩn đoán lỗi Debug">
           <svg class="icon"><use href="#i-bug"/></svg>
           <span>Debug</span>
         </button>
@@ -229,6 +229,39 @@
         <div class="modal-actions">
           <a id="donate-momo" class="btn btn-momo" href="https://me.momo.vn/binhake" target="_blank" rel="noopener noreferrer">Mở MoMo</a>
           <a id="donate-paypal" class="btn btn-paypal" href="https://paypal.me/snns07" target="_blank" rel="noopener noreferrer">PayPal</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Hộp thoại chẩn đoán lỗi (Debug) ===== -->
+    <div id="debug-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="debug-title" hidden>
+      <div class="modal-card debug-card">
+        <button type="button" id="debug-close" class="donate-close" title="Đóng (Esc)" aria-label="Đóng">
+          <svg class="icon"><use href="#i-x"/></svg>
+        </button>
+        <div class="modal-icon debug-modal-icon">
+          <svg class="icon"><use href="#i-bug"/></svg>
+        </div>
+        <h2 id="debug-title" class="modal-title">Chẩn đoán lỗi (Debug)</h2>
+        <p class="modal-desc">
+          Mặc định chế độ ghi log được <strong>tắt</strong> để tối ưu tốc độ. Khi cần tạo Issue báo lỗi trên GitHub, hãy bật công tắc bên dưới, thao tác lại lỗi trên Facebook rồi bấm tải tệp.
+        </p>
+        <label class="debug-switch-row" for="debug-mode-toggle">
+          <div class="debug-switch-text">
+            <span class="debug-switch-title">Ghi nhật ký gỡ lỗi (Debug Log)</span>
+            <span class="debug-switch-sub">Tự động ẩn danh tin nhắn, tên, UID &amp; ảnh riêng tư khi xuất tệp</span>
+          </div>
+          <span class="switch-control">
+            <input type="checkbox" id="debug-mode-toggle" class="switch-input">
+            <span class="switch-slider"></span>
+          </span>
+        </label>
+        <div class="modal-actions">
+          <button type="button" id="debug-cancel-btn" class="btn">Đóng</button>
+          <button type="button" id="debug-export-btn" class="btn btn-primary">
+            <svg class="icon"><use href="#i-download"/></svg>
+            <span>Tải tệp Debug</span>
+          </button>
         </div>
       </div>
     </div>
