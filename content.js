@@ -3709,7 +3709,11 @@
       return cachedImageMap.get(rawSrc);
     }
 
-    if (imgEl.complete && imgEl.naturalWidth > 64 && imgEl.naturalHeight > 64) {
+    // Chỉ chuyển đổi đồng bộ trên canvas đối với ảnh blob: hoặc ảnh có crossOrigin hợp lệ.
+    // Ảnh https:// từ fbcdn không có crossOrigin sẽ làm bẩn (taint) canvas và ném SecurityError nếu gọi lặp lại.
+    const canExportCanvas =
+      rawSrc.startsWith('blob:') || Boolean(imgEl.crossOrigin && imgEl.crossOrigin !== 'null');
+    if (canExportCanvas && imgEl.complete && imgEl.naturalWidth > 64 && imgEl.naturalHeight > 64) {
       try {
         const maxDim = 2048;
         let w = imgEl.naturalWidth;
@@ -3733,7 +3737,11 @@
           cachedImageMap.set(rawSrc, dataUrl);
           return dataUrl;
         }
-      } catch (_) {}
+      } catch (_) {
+        cachedImageMap.set(rawSrc, rawSrc);
+      }
+    } else if (/^https?:\/\//i.test(rawSrc)) {
+      cachedImageMap.set(rawSrc, rawSrc);
     }
 
     return rawSrc;
@@ -3824,6 +3832,8 @@
     return '';
   }
 
+  const rowAnalysisCacheMap = new WeakMap();
+
   function analyzeChatRow(rowEl) {
     if (!rowEl || !(rowEl instanceof HTMLElement)) {
       return {
@@ -3838,6 +3848,19 @@
         rowAvatarUrl: '',
         isSelf: false
       };
+    }
+
+    const rawRowTextContent = (rowEl.textContent || '').trim();
+    const rowCacheSig = `${rowEl.dataset.fbMsgId || ''}|${rowEl.dataset.messageId || ''}|${rowEl.dataset.fbFiberMedia || ''}|${rowEl.dataset.fbViewOnceRow || ''}|${rowEl.dataset.fbUnsendRestored || ''}|${rowEl.childElementCount}|${rawRowTextContent}`;
+    const cachedEntry = rowAnalysisCacheMap.get(rowEl);
+    if (
+      cachedEntry &&
+      cachedEntry.sig === rowCacheSig &&
+      !cachedEntry.result.isUnsentRow &&
+      !cachedEntry.result.isUnsupportedAttachmentRow &&
+      !UNSEND_REGEX.test(rawRowTextContent)
+    ) {
+      return cachedEntry.result;
     }
 
     const senderDetails = extractSenderDetailsFromChatRow(rowEl);
@@ -4292,7 +4315,7 @@
           ? [resolvedRowText]
           : [];
 
-    return {
+    const finalAnalysisResult = {
       isUnsentRow: false,
       alreadyRestored: false,
       isEditedRow,
@@ -4309,6 +4332,10 @@
       rowAvatarUrl,
       isSelf: detectRowIsSelf(rowEl, rowSenderName, unsupportedCardEl)
     };
+    if (!isUnsupportedAttachmentRow && (resolvedRowText || finalAnalysisResult.attachments.length > 0)) {
+      rowAnalysisCacheMap.set(rowEl, { sig: rowCacheSig, result: finalAnalysisResult });
+    }
+    return finalAnalysisResult;
   }
 
   function isSamePersonName(
@@ -4751,11 +4778,16 @@
     const activeClusterHeaderSenderByContainer = new Map();
     const lastNormalRowInfoByContainer = new Map();
     const containerThreadIdMap = new Map();
+    const containerThreadNameMap = new Map();
 
     chatRows.forEach((rowEl, index) => {
       const container = getChatContainerForRow(rowEl);
       const analysis = analyzeChatRow(rowEl);
-      const threadName = findActiveThreadName(rowEl);
+      let threadName = containerThreadNameMap.get(container);
+      if (threadName === undefined) {
+        threadName = findActiveThreadName(rowEl);
+        containerThreadNameMap.set(container, threadName);
+      }
 
       const noticeText = analysis.unsentNoticeEl
         ? (analysis.unsentNoticeEl.textContent || '').trim()
@@ -6716,6 +6748,62 @@
     }
   } catch (_) {}
 
+  const CHAT_CONTAINER_SELECTOR =
+    'div[data-scope="messages_table"], [data-pagelet*="ChatTab"], [aria-label^="Cuộc trò chuyện"], [aria-label^="Đoạn chat"], [aria-label^="Conversation"], [aria-label^="Chat with"], [aria-label^="Community chat"]';
+
+  function isNodeRelatedToChat(node) {
+    if (!node) return false;
+    const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    if (!el || !(el instanceof HTMLElement)) return false;
+    if (el.closest('div[data-scope="messages_table"], [data-pagelet*="ChatTab"]')) {
+      return true;
+    }
+    if (
+      !location.pathname.startsWith('/messages') &&
+      el.closest('[role="feed"], [data-pagelet*="FeedUnit"], [role="main"]')
+    ) {
+      return false;
+    }
+    if (el.closest(CHAT_CONTAINER_SELECTOR)) {
+      return true;
+    }
+    if (
+      el.childElementCount > 0 &&
+      el.querySelector &&
+      el.querySelector('div[data-scope="messages_table"]')
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  function hasChatRelatedMutation(mutations) {
+    for (let i = 0; i < mutations.length; i++) {
+      const mutation = mutations[i];
+      if (mutation.type !== 'childList' && mutation.type !== 'characterData') continue;
+      if (isNodeRelatedToChat(mutation.target)) return true;
+      if (mutation.type === 'childList' && mutation.addedNodes && mutation.addedNodes.length > 0) {
+        for (let j = 0; j < mutation.addedNodes.length; j++) {
+          if (isNodeRelatedToChat(mutation.addedNodes[j])) return true;
+        }
+      }
+      if (mutation.type === 'childList' && mutation.removedNodes && mutation.removedNodes.length > 0) {
+        for (let j = 0; j < mutation.removedNodes.length; j++) {
+          const rn = mutation.removedNodes[j];
+          if (
+            rn &&
+            rn.nodeType === Node.ELEMENT_NODE &&
+            (rn.getAttribute?.('data-scope') === 'messages_table' ||
+              rn.querySelector?.('div[data-scope="messages_table"]'))
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
   function startDomObserver() {
     if (!document.body) {
       window.addEventListener('DOMContentLoaded', startDomObserver, { once: true });
@@ -6726,11 +6814,8 @@
       scheduleDomScan();
 
       const observer = new MutationObserver((mutations) => {
-        for (const mutation of mutations) {
-          if (mutation.type === 'childList' || mutation.type === 'characterData') {
-            scheduleDomScan();
-            break;
-          }
+        if (hasChatRelatedMutation(mutations)) {
+          scheduleDomScan();
         }
       });
 
@@ -6759,13 +6844,6 @@
           scheduleDomScan();
           setTimeout(scheduleDomScan, 400);
           setTimeout(scheduleDomScan, 1000);
-        } else if (unsentMessagesList.length > 0) {
-          const unm = document.querySelector(
-            'div[data-scope="messages_table"]:not([data-fb-unsend-restored="true"])'
-          );
-          if (unm) {
-            scheduleDomScan();
-          }
         }
       }, 1500);
     }, 1000);

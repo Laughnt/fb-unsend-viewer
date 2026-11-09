@@ -1605,14 +1605,18 @@
   }
 
   // ============================================================================
-  // 2. BẮT TRỰC TIẾP VĂN BẢN E2EE TỪ BỘ GIẢI MÃ MAWVault (Qua TextDecoder.decode)
+  // 2. BẮT TRỰC TIẾP VĂN BẢN E2EE TỪ BỘ GIẢI MÃ MAWVault (Qua TextDecoder.decode - chỉ dùng dự phòng khi chưa bắt được mawUnvaultFn)
   // ============================================================================
   TextDecoder.prototype.decode = function (input, options) {
     const result = origTextDecoderDecode.apply(this, arguments);
+    if (mawUnvaultFn) return result;
     try {
-      if (typeof result === 'string' && result.length > 0 && result.length <= 2000) {
+      if (typeof result === 'string' && result.length > 0 && result.length <= 600) {
         const trimmed = result.trim();
-        if (trimmed.length > 0) {
+        if (
+          trimmed.length > 0 &&
+          !/^[{\[<]|https?:\/\/|"__typename"|function\b/.test(trimmed)
+        ) {
           if (isUnsendNoticeText(trimmed)) {
             return result;
           }
@@ -4351,16 +4355,29 @@
     return false;
   }
 
+  const fiberScannedRowSigMap = new WeakMap();
+
   function scanReactFiberOnChatRows() {
     if (!document.body) return;
     if (!lsContactsSynced) {
       syncContactsFromLSDatabase();
     }
-    syncEditHistoryFromLSDatabase();
     let updatedCount = 0;
     const rows = document.querySelectorAll('div[data-scope="messages_table"]');
     rows.forEach((rowEl) => {
       const currentId = rowEl.dataset.fbMsgId || '';
+      const rawRowText = (rowEl.textContent || '').trim();
+      const rowSig = `${currentId}|${rowEl.dataset.messageId || ''}|${rowEl.childElementCount}|${rawRowText.length}|${rawRowText.slice(0, 80)}`;
+      if (
+        currentId &&
+        fiberScannedRowSigMap.get(rowEl) === rowSig &&
+        rowEl.dataset.fbViewOnceRow !== 'true' &&
+        !UNSUPPORTED_ATTACHMENT_DOM_REGEX.test(rawRowText) &&
+        !unlockedViewOnceMediaMap.has(currentId)
+      ) {
+        return;
+      }
+
       const msgId = findFiberMessageIdForRow(rowEl);
       if (msgId) {
         const e2eeIds = extractIdsFromE2EEMsgId(msgId);
@@ -4395,7 +4412,6 @@
         updatedCount++;
       }
 
-      const rawRowText = (rowEl.innerText || rowEl.textContent || '').trim();
       const isViewOnceBubble = isDomRowViewOnceBubble(rowEl);
       if (isViewOnceBubble && rowEl.dataset.fbViewOnceRow !== 'true') {
         rowEl.dataset.fbViewOnceRow = 'true';
@@ -4421,6 +4437,14 @@
           rowEl.dataset.fbFiberMedia = serialized;
           updatedCount++;
         }
+      }
+
+      const finalId = rowEl.dataset.fbMsgId || '';
+      if (finalId) {
+        fiberScannedRowSigMap.set(
+          rowEl,
+          `${finalId}|${rowEl.dataset.messageId || ''}|${rowEl.childElementCount}|${rawRowText.length}|${rawRowText.slice(0, 80)}`
+        );
       }
 
       if (isUnsupportedRow && !rowEl.dataset.fbUnsupportedLogged) {
