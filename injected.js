@@ -703,6 +703,19 @@
     };
   }
 
+  function isGroupParticipantSubtitle(str) {
+    if (!str || typeof str !== 'string') return false;
+    const trimmed = unvaultString(str).trim();
+    if (!trimmed) return false;
+    return (
+      /^(Người tạo nhóm|Do bạn thêm|Quản trị viên|Quản trị viên nhóm|Người kiểm duyệt|Thành viên nhóm|Group creator|Added by you|Group admin|Admin|Moderator)$/i.test(
+        trimmed
+      ) ||
+      /^.{1,60}\s+đã thêm$/i.test(trimmed) ||
+      /^Added by\s+.{1,60}$/i.test(trimmed)
+    );
+  }
+
   function recordContactAlias(contactId, rawName, isNickname = false, threadId = '') {
     const cleanId = contactId
       ? String(contactId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '')
@@ -715,7 +728,8 @@
       cleanName.length > 80 ||
       /^https?:\/\//i.test(cleanName) ||
       isTechnicalString(cleanName) ||
-      isUnsendNoticeText(cleanName)
+      isUnsendNoticeText(cleanName) ||
+      isGroupParticipantSubtitle(cleanName)
     ) {
       return false;
     }
@@ -729,10 +743,6 @@
       changed = true;
     }
     if (isNickname) {
-      if (contactNicknameMap.get(cleanId) !== cleanName) {
-        contactNicknameMap.set(cleanId, cleanName);
-        changed = true;
-      }
       const cleanTid = threadId
         ? String(threadId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '')
         : '';
@@ -752,15 +762,36 @@
     if (avatarEmitTimer) return;
     avatarEmitTimer = setTimeout(() => {
       avatarEmitTimer = null;
-      if (contactAvatarMap.size === 0 && contactAliasesMap.size === 0) return;
+      if (
+        contactAvatarMap.size === 0 &&
+        contactNameMap.size === 0 &&
+        contactAliasesMap.size === 0 &&
+        threadNameMap.size === 0
+      ) {
+        return;
+      }
       const aliasesById = {};
       for (const [id, set] of contactAliasesMap.entries()) {
         if (id && set && set.size > 0) {
-          aliasesById[id] = Array.from(set);
+          aliasesById[id] = Array.from(set).filter((a) => !isGroupParticipantSubtitle(a));
+        }
+      }
+      const cleanNamesById = {};
+      for (const [id, name] of contactNameMap.entries()) {
+        if (id && name && !isGroupParticipantSubtitle(name)) {
+          cleanNamesById[id] = name;
+        }
+      }
+      const cleanThreadNamesById = {};
+      for (const [id, tName] of threadNameMap.entries()) {
+        if (id && tName && !isGroupParticipantSubtitle(tName)) {
+          cleanThreadNamesById[id] = tName;
         }
       }
       emitToContentScript('FB_CONTACT_AVATARS_UPDATED', {
         byId: Object.fromEntries(contactAvatarMap.entries()),
+        namesById: cleanNamesById,
+        threadNamesById: cleanThreadNamesById,
         aliasesById
       });
     }, 350);
@@ -944,11 +975,10 @@
             row.profilePictureFallbackUrl ||
             '';
           const picUrl = typeof rawPic === 'string' ? unvaultString(rawPic).trim() : '';
-          if (cId && cName) {
+          if (cId && cName && !isGroupParticipantSubtitle(cName)) {
             contactNameMap.set(cId, cName);
-            if (recordContactAlias(cId, cName, false)) {
-              added++;
-            }
+            added++;
+            recordContactAlias(cId, cName, false);
           }
           if (cId && picUrl && /^https?:\/\//i.test(picUrl)) {
             contactAvatarMap.set(cId, picUrl);
@@ -983,7 +1013,7 @@
                 pRow.participantNickname ??
                 '';
               const nick = typeof rawNick === 'string' ? unvaultString(rawNick).trim() : '';
-              if (cId && nick) {
+              if (cId && nick && !isGroupParticipantSubtitle(nick)) {
                 if (recordContactAlias(cId, nick, true, tId)) {
                   added++;
                 }
@@ -1001,43 +1031,62 @@
     }
   }
 
+  setTimeout(syncContactsFromLSDatabase, 2500);
+  setTimeout(syncContactsFromLSDatabase, 6500);
+
   function resolveContactAndThreadName(senderId, threadId, explicitSenderName = '', explicitThreadName = '') {
     const cleanSenderId = senderId ? String(senderId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '') : '';
     const cleanThreadId = threadId ? String(threadId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '') : '';
 
-    if (cleanSenderId && explicitSenderName) {
-      recordContactAlias(cleanSenderId, explicitSenderName, false, cleanThreadId);
+    const validExplicitSender =
+      explicitSenderName && !isGroupParticipantSubtitle(explicitSenderName)
+        ? explicitSenderName.trim()
+        : '';
+    const validExplicitThread =
+      explicitThreadName && !isGroupParticipantSubtitle(explicitThreadName)
+        ? explicitThreadName.trim()
+        : '';
+
+    if (cleanSenderId && validExplicitSender) {
+      recordContactAlias(cleanSenderId, validExplicitSender, false, cleanThreadId);
     }
 
-    const mappedContact = cleanSenderId ? contactNameMap.get(cleanSenderId) || '' : '';
-    const mappedNickname =
+    const rawMappedContact = cleanSenderId ? contactNameMap.get(cleanSenderId) || '' : '';
+    const mappedContact = !isGroupParticipantSubtitle(rawMappedContact) ? rawMappedContact : '';
+    const rawMappedNickname =
       (cleanThreadId &&
         cleanSenderId &&
         contactNicknameMap.get(`${cleanThreadId}__${cleanSenderId}`)) ||
-      (cleanSenderId && contactNicknameMap.get(cleanSenderId)) ||
       '';
-    const hasExplicitThreadMap = Boolean(cleanThreadId && threadNameMap.has(cleanThreadId));
+    const mappedNickname = !isGroupParticipantSubtitle(rawMappedNickname) ? rawMappedNickname : '';
+    const rawThreadMapName = cleanThreadId ? threadNameMap.get(cleanThreadId) || '' : '';
+    const cleanThreadMapName = !isGroupParticipantSubtitle(rawThreadMapName) ? rawThreadMapName : '';
+    const hasExplicitThreadMap = Boolean(cleanThreadMapName);
+    const rawContactThreadName = cleanThreadId ? contactNameMap.get(cleanThreadId) || '' : '';
+    const cleanContactThreadName = !isGroupParticipantSubtitle(rawContactThreadName)
+      ? rawContactThreadName
+      : '';
     const mappedThread = cleanThreadId
-      ? threadNameMap.get(cleanThreadId) ||
+      ? cleanThreadMapName ||
+        cleanContactThreadName ||
         (cleanThreadId === cleanSenderId && mappedNickname ? mappedNickname : '') ||
-        contactNameMap.get(cleanThreadId) ||
         ''
       : '';
 
-    const finalPersonName = explicitSenderName || mappedNickname || mappedContact || '';
-    const finalThreadName = explicitThreadName || mappedThread || '';
-    const isFallbackThreadName = Boolean(!explicitThreadName && !hasExplicitThreadMap && mappedThread);
+    const finalPersonName = mappedContact || validExplicitSender || mappedNickname || '';
+    const finalThreadName = validExplicitThread || mappedThread || '';
+    const isFallbackThreadName = Boolean(!validExplicitThread && !hasExplicitThreadMap && mappedThread);
     const avatarUrl = (cleanSenderId && contactAvatarMap.get(cleanSenderId)) || '';
 
     const aliasSet = new Set();
     const pushAlias = (val) => {
       if (!val || typeof val !== 'string') return;
       const trimmed = val.trim();
-      if (trimmed) aliasSet.add(trimmed);
+      if (trimmed && !isGroupParticipantSubtitle(trimmed)) aliasSet.add(trimmed);
     };
-    pushAlias(explicitSenderName);
-    pushAlias(mappedNickname);
     pushAlias(mappedContact);
+    pushAlias(validExplicitSender);
+    pushAlias(mappedNickname);
     if (cleanSenderId && contactAliasesMap.has(cleanSenderId)) {
       for (const a of contactAliasesMap.get(cleanSenderId)) {
         pushAlias(a);
@@ -1629,7 +1678,9 @@
               candidate.length >= 2 &&
               candidate.length <= 80 &&
               !candidate.startsWith('http') &&
-              !isTechnicalString(candidate)
+              !isTechnicalString(candidate) &&
+              !isUnsendNoticeText(candidate) &&
+              !isGroupParticipantSubtitle(candidate)
             ) {
               if (!foundName) foundName = candidate;
               if (recordContactAlias(contactId, candidate, false)) {
@@ -1638,8 +1689,9 @@
             }
           }
         }
-        if (foundName) {
+        if (foundName && contactNameMap.get(contactId) !== foundName) {
           contactNameMap.set(contactId, foundName);
+          changed = true;
         }
         if (foundAvatar) {
           contactAvatarMap.set(contactId, foundAvatar);
@@ -1673,7 +1725,8 @@
             candidate.length <= 80 &&
             !candidate.startsWith('http') &&
             !isTechnicalString(candidate) &&
-            !isUnsendNoticeText(candidate)
+            !isUnsendNoticeText(candidate) &&
+            !isGroupParticipantSubtitle(candidate)
           ) {
             names.push(candidate);
           }
@@ -1713,14 +1766,16 @@
             !candidate.startsWith('http') &&
             !/^(inbox|pending|other|archived|spam)$/i.test(candidate) &&
             !isTechnicalString(candidate) &&
-            !isUnsendNoticeText(candidate)
+            !isUnsendNoticeText(candidate) &&
+            !isGroupParticipantSubtitle(candidate)
           ) {
             threadName = candidate;
           }
         }
       }
-      if (threadId && threadName) {
+      if (threadId && threadName && threadNameMap.get(threadId) !== threadName) {
         threadNameMap.set(threadId, threadName);
+        scheduleEmitContactAvatars();
       }
       return;
     }
@@ -3406,8 +3461,11 @@
         directTextLiterals.length > 0
       ) {
         const cId = directI64Values[0];
-        const cName = directTextLiterals[0];
-        if (cId && cId !== '0' && cName.length >= 2 && cName.length <= 80) {
+        const cName = directTextLiterals.find(
+          (lit) => lit && lit.length >= 2 && lit.length <= 80 && !isGroupParticipantSubtitle(lit)
+        );
+        if (cId && cId !== '0' && cName) {
+          contactNameMap.set(cId, cName);
           recordContactAlias(cId, cName, false);
           if (directMediaUrls.length > 0 && /^https?:\/\//i.test(directMediaUrls[0])) {
             contactAvatarMap.set(cId, directMediaUrls[0]);
@@ -3432,7 +3490,8 @@
             lit &&
             lit.length >= 2 &&
             lit.length <= 80 &&
-            !/^(inbox|pending|other|archived|spam)$/i.test(lit)
+            !/^(inbox|pending|other|archived|spam)$/i.test(lit) &&
+            !isGroupParticipantSubtitle(lit)
         );
         if (cId && nick) {
           recordContactAlias(cId, nick, true, tId);
@@ -3448,10 +3507,14 @@
           return v.length >= 6 && !(n > 1577836800000 && n < 2051222400000);
         });
         const tName = directTextLiterals.find(
-          (lit) => !/^(inbox|pending|other|archived|spam)$/i.test(lit)
+          (lit) =>
+            lit &&
+            !/^(inbox|pending|other|archived|spam)$/i.test(lit) &&
+            !isGroupParticipantSubtitle(lit)
         );
         if (tId && tName && tName.length >= 2 && tName.length <= 100) {
           threadNameMap.set(tId, tName);
+          scheduleEmitContactAvatars();
         }
       }
 

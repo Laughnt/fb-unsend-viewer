@@ -182,7 +182,8 @@
       clean.startsWith('mid.$') ||
       clean.startsWith('wmid.') ||
       clean.startsWith('otid.') ||
-      /^\d+@(msgr|g\.us)\.\d+$/.test(clean)
+      /^\d+@(msgr|g\.us)\.\d+$/.test(clean) ||
+      /^\d{15,22}$/.test(clean)
     );
   }
 
@@ -254,18 +255,17 @@
 
     const partsA = extractE2EEParts(canonA);
     const partsB = extractE2EEParts(canonB);
-    if (
-      allowSameE2EEThreadFallback &&
-      partsA &&
-      partsB &&
-      partsA.threadPrefix === partsB.threadPrefix
-    ) {
-      const aHasOtherAlias =
-        e2eeRevokeAliasMap.has(idA) && e2eeRevokeAliasMap.get(idA) !== canonB;
-      const bHasOtherAlias =
-        e2eeRevokeAliasMap.has(idB) && e2eeRevokeAliasMap.get(idB) !== canonA;
-      if (!aHasOtherAlias && !bHasOtherAlias) {
-        return true;
+    if (allowSameE2EEThreadFallback) {
+      const sameE2EEThread = Boolean(partsA && partsB && partsA.threadPrefix === partsB.threadPrefix);
+      const e2eeWithBareStanza = Boolean((partsA && stanzaB && !partsB) || (partsB && stanzaA && !partsA));
+      if (sameE2EEThread || e2eeWithBareStanza) {
+        const aHasOtherAlias =
+          e2eeRevokeAliasMap.has(idA) && e2eeRevokeAliasMap.get(idA) !== canonB;
+        const bHasOtherAlias =
+          e2eeRevokeAliasMap.has(idB) && e2eeRevokeAliasMap.get(idB) !== canonA;
+        if (!aHasOtherAlias && !bHasOtherAlias) {
+          return true;
+        }
       }
     }
     return false;
@@ -450,7 +450,10 @@
 
   let currentUserId = '';
   let currentUserFullName = '';
+  let isCurrentUserNameAuthoritative = false;
   const personAvatarByIdMap = new Map();
+  const personRealNameByIdMap = new Map();
+  const threadRealNameByIdMap = new Map();
   const personAvatarByThreadAndNameMap = new Map();
   const personIdByThreadAndNameMap = new Map();
   const personAliasesByIdMap = new Map();
@@ -963,6 +966,71 @@
           itemChanged = true;
         }
       }
+      const cleanSid = item.senderId
+        ? String(item.senderId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '')
+        : '';
+      const cleanTid = item.threadId
+        ? String(item.threadId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '')
+        : '';
+      if (item.isSelf) {
+        if (currentUserFullName && item.personName !== currentUserFullName) {
+          item.personName = currentUserFullName;
+          itemChanged = true;
+        }
+        if (Array.isArray(item.personAliases) && item.personAliases.length > 0) {
+          item.personAliases = [];
+          itemChanged = true;
+        }
+      } else {
+        const cleanedAliases = mergePersonAliasesList(item.personAliases, item.personName);
+        if (
+          !Array.isArray(item.personAliases) ||
+          cleanedAliases.length !== item.personAliases.length ||
+          cleanedAliases.some((a, idx) => a !== item.personAliases[idx])
+        ) {
+          item.personAliases = cleanedAliases;
+          itemChanged = true;
+        }
+        const preferredPerson = resolvePreferredPersonName(
+          cleanSid,
+          false,
+          item.personName,
+          cleanedAliases
+        );
+        if (preferredPerson && preferredPerson !== item.personName) {
+          item.personName = preferredPerson;
+          itemChanged = true;
+        }
+      }
+      let nextThread = !isGenericSenderName(item.threadName) ? String(item.threadName).trim() : '';
+      if (!nextThread && cleanTid) {
+        nextThread =
+          threadRealNameByIdMap.get(cleanTid) ||
+          personRealNameByIdMap.get(cleanTid) ||
+          (!item.isSelf && cleanTid === cleanSid ? item.personName || '' : '') ||
+          '';
+      } else if (
+        cleanTid &&
+        cleanTid === cleanSid &&
+        !item.isSelf &&
+        personRealNameByIdMap.has(cleanTid) &&
+        nextThread !== personRealNameByIdMap.get(cleanTid)
+      ) {
+        nextThread = personRealNameByIdMap.get(cleanTid);
+      }
+      if (nextThread !== (item.threadName || '')) {
+        item.threadName = nextThread;
+        itemChanged = true;
+      }
+      const nextSenderName = formatSenderAndThreadName(
+        item.personName,
+        item.threadName,
+        !isGenericSenderName(item.senderName) ? item.senderName : ''
+      );
+      if (nextSenderName && nextSenderName !== item.senderName) {
+        item.senderName = nextSenderName;
+        itemChanged = true;
+      }
       const resolved = resolveAvatarForPerson(
         item.personName,
         item.senderId,
@@ -996,7 +1064,10 @@
           currentUserId = m[1];
         }
       }
-      if ((!currentUserFullName || !currentUserId) && document.documentElement) {
+      if (
+        (!currentUserFullName || !isCurrentUserNameAuthoritative || !currentUserId) &&
+        document.documentElement
+      ) {
         const scripts = document.querySelectorAll('script');
         for (const s of scripts) {
           const txt = s.textContent || '';
@@ -1009,19 +1080,35 @@
               currentUserId = idMatch[1];
             }
           }
-          if (!currentUserFullName) {
+          if (!currentUserFullName || !isCurrentUserNameAuthoritative) {
             const nameMatch = txt.match(
               /"CurrentUserInitialData"\s*,\s*\[\]\s*,\s*\{[^}]*?"NAME"\s*:\s*"((?:[^"\\]|\\.)*)"/
             );
             if (nameMatch && nameMatch[1]) {
+              let parsedName = '';
               try {
-                currentUserFullName = JSON.parse(`"${nameMatch[1]}"`).trim();
+                parsedName = JSON.parse(`"${nameMatch[1]}"`).trim();
               } catch (_) {
-                currentUserFullName = nameMatch[1].trim();
+                parsedName = nameMatch[1].trim();
+              }
+              if (parsedName && !isGenericSenderName(parsedName)) {
+                currentUserFullName = parsedName;
+                isCurrentUserNameAuthoritative = true;
               }
             }
           }
-          if (currentUserId && currentUserFullName) break;
+          if (currentUserId && currentUserFullName && isCurrentUserNameAuthoritative) break;
+        }
+      }
+      if (
+        currentUserId &&
+        (!currentUserFullName || !isCurrentUserNameAuthoritative) &&
+        personRealNameByIdMap.has(String(currentUserId))
+      ) {
+        const realSelfName = personRealNameByIdMap.get(String(currentUserId));
+        if (realSelfName && !isGenericSenderName(realSelfName)) {
+          currentUserFullName = realSelfName;
+          isCurrentUserNameAuthoritative = true;
         }
       }
     } catch (_) {}
@@ -1249,7 +1336,16 @@
     if (!msg || typeof msg !== 'object') return msg;
     const base = stripDomReferences(msg);
     const inferredSelf = inferRecordIsSelf(base);
-    const cleanThread = !isGenericSenderName(base.threadName) ? String(base.threadName).trim() : '';
+    const e2eeIds = extractPeerIdFromE2EEMsgId(
+      base.messageId || base.originalMessageId || base.fiberMsgId || '',
+      inferredSelf
+    );
+    const finalSenderId = base.senderId || e2eeIds.senderId || '';
+    const finalThreadId = base.threadId || e2eeIds.threadId || '';
+    const cleanSid = String(finalSenderId || '').trim().replace(/@(msgr|g\.us|c\.us)$/i, '');
+    const cleanTid = String(finalThreadId || '').trim().replace(/@(msgr|g\.us|c\.us)$/i, '');
+
+    let cleanThread = !isGenericSenderName(base.threadName) ? String(base.threadName).trim() : '';
     let cleanPerson = !isGenericSenderName(base.personName) ? String(base.personName).trim() : '';
     let cleanSender = String(base.senderName || '').trim();
     if (cleanSender.includes('•')) {
@@ -1258,12 +1354,24 @@
         .map((p) => p.trim())
         .filter((p) => p && !isGenericSenderName(p));
       if (!cleanPerson && parts[0]) cleanPerson = parts[0];
+      if (!cleanThread && parts[1]) cleanThread = parts[1];
       cleanSender = parts.join(' • ');
     } else if (isGenericSenderName(cleanSender)) {
       cleanSender = '';
     }
-    if (inferredSelf && currentUserFullName) {
-      cleanPerson = currentUserFullName;
+    const cleanPersonAliases = inferredSelf
+      ? []
+      : mergePersonAliasesList(base.personAliases, cleanPerson, base.personName);
+    cleanPerson =
+      resolvePreferredPersonName(cleanSid, inferredSelf, cleanPerson, cleanPersonAliases) ||
+      cleanPerson ||
+      (inferredSelf ? currentUserFullName || 'Bạn' : '');
+    if (!cleanThread && cleanTid) {
+      cleanThread =
+        threadRealNameByIdMap.get(cleanTid) ||
+        personRealNameByIdMap.get(cleanTid) ||
+        (!inferredSelf && cleanTid === cleanSid ? cleanPerson : '') ||
+        '';
     }
     const finalSender = formatSenderAndThreadName(cleanPerson, cleanThread, cleanSender);
     const cleanAttachments = sanitizeAttachmentsList(base.attachments);
@@ -1290,25 +1398,20 @@
           (base.text && isDashMpdXmlString(base.text) && cleanAttachments.length === 0
             ? '🎬 [Video]'
             : '');
-    const e2eeIds = extractPeerIdFromE2EEMsgId(
-      base.messageId || base.originalMessageId || base.fiberMsgId || '',
-      inferredSelf
-    );
-    const finalSenderId = base.senderId || e2eeIds.senderId || '';
-    const finalThreadId = base.threadId || e2eeIds.threadId || '';
-    const cleanPersonAliases = inferredSelf
-      ? []
-      : mergePersonAliasesList(base.personAliases, cleanPerson, base.personName);
     if (!inferredSelf && cleanPersonAliases.length > 0) {
       registerPersonIdentityAliases(finalSenderId, cleanPersonAliases, cleanThread);
     }
     const resolvedAvatar = resolveAvatarForPerson(
-      cleanPerson || base.personName || '',
+      cleanPerson,
       finalSenderId,
       inferredSelf,
       base.avatarUrl,
       cleanThread
     );
+    const cleanAnchorAboveSender =
+      base.anchorAboveSender && !isGenericSenderName(base.anchorAboveSender)
+        ? String(base.anchorAboveSender).trim()
+        : '';
     return {
       ...base,
       text: cleanText,
@@ -1316,10 +1419,11 @@
       isSelf: inferredSelf,
       senderId: finalSenderId,
       threadId: finalThreadId,
-      personName: cleanPerson || base.personName || '',
+      personName: cleanPerson,
       personAliases: cleanPersonAliases,
       threadName: cleanThread,
       senderName: finalSender,
+      anchorAboveSender: cleanAnchorAboveSender,
       avatarUrl: resolvedAvatar || base.avatarUrl || '',
       attachments: cleanAttachments
     };
@@ -2153,6 +2257,20 @@
           }
         }
       }
+      if (payload.namesById && typeof payload.namesById === 'object') {
+        for (const [id, name] of Object.entries(payload.namesById)) {
+          if (id && typeof name === 'string' && !isGenericSenderName(name)) {
+            personRealNameByIdMap.set(id, name.trim());
+          }
+        }
+      }
+      if (payload.threadNamesById && typeof payload.threadNamesById === 'object') {
+        for (const [id, tName] of Object.entries(payload.threadNamesById)) {
+          if (id && typeof tName === 'string' && !isGenericSenderName(tName)) {
+            threadRealNameByIdMap.set(id, tName.trim());
+          }
+        }
+      }
       if (payload.aliasesById && typeof payload.aliasesById === 'object') {
         for (const [id, aliasList] of Object.entries(payload.aliasesById)) {
           if (id && Array.isArray(aliasList)) {
@@ -2160,6 +2278,7 @@
           }
         }
       }
+      detectCurrentUserIdentity();
       backfillAvatarsInStoredLists();
     } else if (type === 'FB_E2EE_REVOKE_RESOLVED') {
       handleE2EERevokeResolved(payload);
@@ -2182,9 +2301,11 @@
     const trimmed = name.trim();
     if (!trimmed || !/[\p{L}\p{N}]/u.test(trimmed)) return true;
     return (
-      /^(Facebook Chat|Facebook|Messenger|Đoạn chat|Danh sách đoạn chat|Chats|Chat|Cuộc trò chuyện|Nội dung cuộc trò chuyện|Tin nhắn trong cuộc trò chuyện|Thông tin về đoạn chat|Chi tiết đoạn chat|Cuộc trò chuyện đang hoạt động|Conversation|Thread|Messages|inbox|pending|other|archived|spam|Đang hoạt động|Hoạt động\s+.+\s+trước|Active now|Active\s+.+\s+ago)$/i.test(
+      /^(Facebook Chat|Facebook|Messenger|Đoạn chat|Danh sách đoạn chat|Chats|Chat|Cuộc trò chuyện|Nội dung cuộc trò chuyện|Tin nhắn trong cuộc trò chuyện|Thông tin về đoạn chat|Chi tiết đoạn chat|Cuộc trò chuyện đang hoạt động|Conversation|Thread|Messages|inbox|pending|other|archived|spam|Đang hoạt động|Hoạt động\s+.+\s+trước|Active now|Active\s+.+\s+ago|Người tạo nhóm|Do bạn thêm|Quản trị viên|Quản trị viên nhóm|Người kiểm duyệt|Thành viên nhóm|Group creator|Added by you|Group admin|Admin|Moderator)$/i.test(
         trimmed
-      )
+      ) ||
+      /^.{1,60}\s+đã thêm$/i.test(trimmed) ||
+      /^Added by\s+.{1,60}$/i.test(trimmed)
     );
   }
 
@@ -2237,6 +2358,33 @@
       }
     }
     return best;
+  }
+
+  function resolvePreferredPersonName(
+    senderId,
+    isSelf = false,
+    primaryCandidate = '',
+    fallbackCandidates = []
+  ) {
+    const extraList = Array.isArray(fallbackCandidates)
+      ? fallbackCandidates
+      : [fallbackCandidates];
+    if (isSelf) {
+      if (currentUserFullName && !isGenericSenderName(currentUserFullName)) {
+        return currentUserFullName;
+      }
+      return chooseBestPersonName(primaryCandidate, ...extraList) || 'Bạn';
+    }
+    const cleanId = senderId
+      ? String(senderId).trim().replace(/@(msgr|g\.us|c\.us)$/i, '')
+      : '';
+    if (cleanId && personRealNameByIdMap.has(cleanId)) {
+      const mappedReal = personRealNameByIdMap.get(cleanId);
+      if (mappedReal && !isGenericSenderName(mappedReal)) {
+        return mappedReal;
+      }
+    }
+    return chooseBestPersonName(primaryCandidate, ...extraList);
   }
 
   function normalizeThreadTitle(name) {
@@ -2328,6 +2476,8 @@
 
     detectCurrentUserIdentity();
     if (
+      !currentUserFullName &&
+      !isCurrentUserNameAuthoritative &&
       currentUserId &&
       msg.senderId &&
       String(msg.senderId) === String(currentUserId) &&
@@ -2408,11 +2558,19 @@
 
     const contextRow = msg.rowEl || existing?.rowEl || null;
     const activeThread = contextRow ? findActiveThreadName(contextRow) : '';
+    const finalIsSelf = typeof msg.isSelf === 'boolean' ? msg.isSelf : existing?.isSelf ?? msgIsSelf;
+    const e2eeIds = extractPeerIdFromE2EEMsgId(bestId, finalIsSelf);
+    const resolvedSenderId = msg.senderId || existing?.senderId || e2eeIds.senderId || '';
+    const resolvedThreadId = msg.threadId || existing?.threadId || e2eeIds.threadId || '';
     const resolvedPerson =
-      chooseBestPersonName(msg.personName, existing?.personName) ||
-      (msgIsSelf && currentUserFullName ? currentUserFullName : '') ||
-      msg.personName ||
-      existing?.personName ||
+      resolvePreferredPersonName(resolvedSenderId, finalIsSelf, msg.personName, [
+        existing?.personName,
+        ...(msg.personAliases || []),
+        ...(existing?.personAliases || [])
+      ]) ||
+      (finalIsSelf && currentUserFullName ? currentUserFullName : '') ||
+      (!isGenericSenderName(msg.personName) ? msg.personName : '') ||
+      (!isGenericSenderName(existing?.personName) ? existing?.personName : '') ||
       '';
 
     const bestThread =
@@ -2457,10 +2615,6 @@
         ? ''
         : rawMergedText;
 
-    const finalIsSelf = typeof msg.isSelf === 'boolean' ? msg.isSelf : existing?.isSelf ?? msgIsSelf;
-    const e2eeIds = extractPeerIdFromE2EEMsgId(bestId, finalIsSelf);
-    const resolvedSenderId = msg.senderId || existing?.senderId || e2eeIds.senderId || '';
-    const resolvedThreadId = msg.threadId || existing?.threadId || e2eeIds.threadId || '';
     const isOneOnOneThread = Boolean(
       resolvedSenderId && resolvedThreadId && String(resolvedSenderId) === String(resolvedThreadId)
     );
@@ -2654,11 +2808,23 @@
               ...(existingItem.attachments || [])
             ]);
 
+      const e2eeIds = extractPeerIdFromE2EEMsgId(
+        bestId || newRecord.originalMessageId || '',
+        recIsSelf
+      );
+      const resolvedSenderId =
+        newRecord.senderId || existingItem.senderId || e2eeIds.senderId || '';
+      const resolvedThreadId =
+        newRecord.threadId || existingItem.threadId || e2eeIds.threadId || '';
       const bestPerson =
-        chooseBestPersonName(newRecord.personName, existingItem.personName) ||
+        resolvePreferredPersonName(resolvedSenderId, recIsSelf, newRecord.personName, [
+          existingItem.personName,
+          ...(newRecord.personAliases || []),
+          ...(existingItem.personAliases || [])
+        ]) ||
         (recIsSelf && currentUserFullName ? currentUserFullName : '') ||
-        newRecord.personName ||
-        existingItem.personName ||
+        (!isGenericSenderName(newRecord.personName) ? newRecord.personName : '') ||
+        (!isGenericSenderName(existingItem.personName) ? existingItem.personName : '') ||
         '';
 
       const threadCandA = !isGenericSenderName(newRecord.threadName) ? newRecord.threadName : '';
@@ -2692,21 +2858,15 @@
           ? ''
           : rawMergedText;
 
-      const e2eeIds = extractPeerIdFromE2EEMsgId(
-        bestId || newRecord.originalMessageId || '',
-        recIsSelf
-      );
-      const resolvedSenderId =
-        newRecord.senderId || existingItem.senderId || e2eeIds.senderId || '';
-      const resolvedThreadId =
-        newRecord.threadId || existingItem.threadId || e2eeIds.threadId || '';
-      const mergedPersonAliases = mergePersonAliasesList(
-        existingItem.personAliases,
-        newRecord.personAliases,
-        existingItem.personName,
-        newRecord.personName,
-        bestPerson
-      );
+      const mergedPersonAliases = recIsSelf
+        ? []
+        : mergePersonAliasesList(
+            existingItem.personAliases,
+            newRecord.personAliases,
+            existingItem.personName,
+            newRecord.personName,
+            bestPerson
+          );
       if (!recIsSelf) {
         registerPersonIdentityAliases(
           resolvedSenderId,
@@ -2808,9 +2968,25 @@
     );
     const finalSenderId = newRecord.senderId || newE2eeIds.senderId || '';
     const finalThreadId = newRecord.threadId || newE2eeIds.threadId || '';
-    const finalPersonAliases = mergePersonAliasesList(
-      newRecord.personAliases,
-      newRecord.personName
+    const finalPersonAliases = recIsSelf
+      ? []
+      : mergePersonAliasesList(newRecord.personAliases, newRecord.personName);
+    const finalPersonName =
+      resolvePreferredPersonName(
+        finalSenderId,
+        recIsSelf,
+        newRecord.personName,
+        finalPersonAliases
+      ) ||
+      (!isGenericSenderName(newRecord.personName) ? newRecord.personName : '') ||
+      '';
+    const finalThreadName = !isGenericSenderName(newRecord.threadName)
+      ? String(newRecord.threadName).trim()
+      : '';
+    const finalSenderName = formatSenderAndThreadName(
+      finalPersonName,
+      finalThreadName,
+      newRecord.senderName || ''
     );
     if (!recIsSelf) {
       registerPersonIdentityAliases(
@@ -2818,16 +2994,16 @@
         finalPersonAliases,
         finalThreadId,
         finalSenderId && finalThreadId && String(finalSenderId) === String(finalThreadId)
-          ? newRecord.threadName
+          ? finalThreadName
           : ''
       );
     }
     const finalAvatar = resolveAvatarForPerson(
-      newRecord.personName,
+      finalPersonName,
       finalSenderId,
       recIsSelf,
       newRecord.avatarUrl,
-      newRecord.threadName
+      finalThreadName
     );
 
     const cleanEditHistory = sanitizeEditHistoryList(newRecord.editHistory, finalCleanText);
@@ -2841,6 +3017,9 @@
       isSelf: recIsSelf,
       senderId: finalSenderId,
       threadId: finalThreadId,
+      personName: finalPersonName,
+      threadName: finalThreadName,
+      senderName: finalSenderName,
       personAliases: finalPersonAliases,
       avatarUrl: finalAvatar,
       attachments: cleanAttachments,
@@ -2864,6 +3043,8 @@
     dlog('UNSENT-EVENT', '#fdcb6e', 'Nhận sự kiện FB_MSG_UNSENT từ MAIN:', unsentData);
     detectCurrentUserIdentity();
     if (
+      !currentUserFullName &&
+      !isCurrentUserNameAuthoritative &&
       currentUserId &&
       unsentData.senderId &&
       String(unsentData.senderId) === String(currentUserId) &&
@@ -3042,19 +3223,24 @@
           });
 
     if (
+      !currentUserFullName &&
+      !isCurrentUserNameAuthoritative &&
       isSelf &&
       (unsentData.personName || existing?.personName) &&
+      !isGenericSenderName(unsentData.personName || existing?.personName) &&
       !isSelfKeyword(unsentData.personName || existing?.personName)
     ) {
       currentUserFullName = (unsentData.personName || existing?.personName).trim();
     }
 
     const bestPerson =
-      (!isSelfKeyword(unsentData.personName) && unsentData.personName) ||
-      (!isSelfKeyword(existing?.personName) && existing?.personName) ||
-      (!isSelfKeyword(noticePerson) && noticePerson) ||
+      resolvePreferredPersonName(earlySenderId, isSelf, unsentData.personName, [
+        existing?.personName,
+        noticePerson,
+        ...earlyAliases
+      ]) ||
       (isSelf && currentUserFullName ? currentUserFullName : '') ||
-      noticePerson ||
+      (!isGenericSenderName(noticePerson) ? noticePerson : '') ||
       '';
     const bestThread =
       (unsentData.isFallbackThreadName &&
@@ -3070,7 +3256,7 @@
       unsentData.senderName || existing?.senderName || ''
     );
 
-    const candidateAliases = mergePersonAliasesList(earlyAliases, bestPerson);
+    const candidateAliases = isSelf ? [] : mergePersonAliasesList(earlyAliases, bestPerson);
 
     const candidateRecord = {
       messageId: unsentData.messageId,
@@ -4755,9 +4941,20 @@
           }
         }
 
+        const isOptimisticToServerUpgrade = Boolean(
+          prev &&
+            prev.rowEl === rowEl &&
+            prev.fiberMsgId &&
+            /^\d{15,22}$/.test(prev.fiberMsgId) &&
+            fiberMsgId &&
+            (fiberMsgId.startsWith('mid.$') || /^\d+@(msgr|g\.us)\.\d+$/.test(fiberMsgId)) &&
+            prev.isSelf === analysis.isSelf &&
+            (!prev.text || !analysis.text || prev.text === analysis.text)
+        );
         const hasConflictingFiberId =
           Boolean(fiberMsgId && prev?.fiberMsgId) &&
           fiberMsgId !== prev.fiberMsgId &&
+          !isOptimisticToServerUpgrade &&
           !areAuthoritativeIdsCompatible(fiberMsgId, prev.fiberMsgId, false);
         const hasConflictingThread =
           Boolean(prev?.threadName && threadName) &&
@@ -4807,16 +5004,25 @@
         const msgId = resolveContentCanonicalId(rawMsgId) || rawMsgId;
 
         const idUpgraded = Boolean(
-          safePrev && safePrev.messageId && fiberMsgId && safePrev.messageId !== fiberMsgId
+          safePrev &&
+            safePrev.messageId &&
+            fiberMsgId &&
+            safePrev.messageId !== fiberMsgId &&
+            (isTempDomId(safePrev.messageId) ||
+              isOptimisticToServerUpgrade ||
+              areAuthoritativeIdsCompatible(fiberMsgId, safePrev.messageId, false))
         );
         if (idUpgraded) {
+          if (/^\d{15,22}$/.test(safePrev.messageId)) {
+            e2eeRevokeAliasMap.set(safePrev.messageId, msgId);
+          }
           currentActiveIds.add(safePrev.messageId);
           messagesById.delete(safePrev.messageId);
           const oldRec = recentByIdMap.get(safePrev.messageId);
           if (oldRec) {
             recentByIdMap.delete(safePrev.messageId);
-            oldRec.messageId = fiberMsgId;
-            indexRecordLookupKeys(oldRec, recentByIdMap);
+            oldRec.messageId = msgId;
+            indexRecordLookupKeys(oldRec, false);
           }
         }
 
@@ -4936,8 +5142,17 @@
           combinedPrevHistory.length > 0
             ? combinedPrevHistory[combinedPrevHistory.length - 1]
             : safePrev?.text || existingById?.text || '';
+        const hasVerifiedSameMessageId = Boolean(
+          fiberMsgId &&
+            safePrev?.fiberMsgId &&
+            (fiberMsgId === safePrev.fiberMsgId ||
+              areAuthoritativeIdsCompatible(fiberMsgId, safePrev.fiberMsgId, false))
+        );
         const isDomTextEdited = Boolean(
-          prevLatestText && analysis.text && analysis.text !== prevLatestText
+          prevLatestText &&
+            analysis.text &&
+            analysis.text !== prevLatestText &&
+            (analysis.isEditedRow || hasVerifiedSameMessageId)
         );
         const recordEditHistory = mergeEditHistoryLists(
           {

@@ -100,9 +100,11 @@ function isGenericName(name) {
   const trimmed = name.trim();
   return (
     !trimmed ||
-    /^(Facebook Chat|Facebook|Messenger|Đoạn chat|Danh sách đoạn chat|Chats|Chat|Cuộc trò chuyện|Nội dung cuộc trò chuyện|Tin nhắn trong cuộc trò chuyện|Thông tin về đoạn chat|Chi tiết đoạn chat|Cuộc trò chuyện đang hoạt động|Conversation|Thread|Messages)$/i.test(
+    /^(Facebook Chat|Facebook|Messenger|Đoạn chat|Danh sách đoạn chat|Chats|Chat|Cuộc trò chuyện|Nội dung cuộc trò chuyện|Tin nhắn trong cuộc trò chuyện|Thông tin về đoạn chat|Chi tiết đoạn chat|Cuộc trò chuyện đang hoạt động|Conversation|Thread|Messages|Người tạo nhóm|Do bạn thêm|Quản trị viên|Quản trị viên nhóm|Người kiểm duyệt|Thành viên nhóm|Group creator|Added by you|Group admin|Admin|Moderator)$/i.test(
       trimmed
-    )
+    ) ||
+    /^.{1,60}\s+đã thêm$/i.test(trimmed) ||
+    /^Added by\s+.{1,60}$/i.test(trimmed)
   );
 }
 
@@ -130,6 +132,24 @@ function parseRecordNames(item) {
   }
 
   const isSelf = Boolean(item.isSelf) || /^(Bạn|You|Chính bạn)$/i.test(person);
+  if (!person && !isSelf && Array.isArray(item.personAliases)) {
+    const validAlias = item.personAliases
+      .map(a => (typeof a === 'string' ? a.trim() : ''))
+      .find(a => a && !isGenericName(a) && !/^(Bạn|You|Chính bạn)$/i.test(a));
+    if (validAlias) {
+      person = validAlias;
+    }
+  }
+  if (
+    !thread &&
+    !isSelf &&
+    person &&
+    item.senderId &&
+    item.threadId &&
+    String(item.senderId).trim() === String(item.threadId).trim()
+  ) {
+    thread = person;
+  }
   if (!person) {
     person = isSelf ? 'Bạn' : thread || 'Người dùng Facebook';
   }
@@ -340,6 +360,51 @@ function sanitizePopupRecord(item) {
     changed = true;
   }
 
+  let cleanPersonName = typeof item.personName === 'string' ? item.personName.trim() : '';
+  let cleanThreadName = typeof item.threadName === 'string' ? item.threadName.trim() : '';
+  let cleanSenderName = typeof item.senderName === 'string' ? item.senderName.trim() : '';
+  const rawAliases = Array.isArray(item.personAliases) ? item.personAliases : [];
+  const cleanAliases = rawAliases
+    .map(a => (typeof a === 'string' ? a.trim() : ''))
+    .filter(a => a && !isGenericName(a) && !/^(Bạn|You|Chính bạn)$/i.test(a));
+
+  if (
+    rawAliases.length !== cleanAliases.length ||
+    rawAliases.some((a, idx) => a !== cleanAliases[idx])
+  ) {
+    changed = true;
+  }
+
+  if (cleanPersonName && isGenericName(cleanPersonName)) {
+    cleanPersonName = item.isSelf ? 'Bạn' : cleanAliases[0] || '';
+    changed = true;
+  }
+  if (cleanThreadName && isGenericName(cleanThreadName)) {
+    const sameDirectId =
+      !item.isSelf &&
+      item.senderId &&
+      item.threadId &&
+      String(item.senderId).trim() === String(item.threadId).trim();
+    cleanThreadName = sameDirectId && cleanPersonName ? cleanPersonName : '';
+    changed = true;
+  }
+  if (cleanSenderName) {
+    if (cleanSenderName.includes('•')) {
+      const parts = cleanSenderName
+        .split('•')
+        .map(p => p.trim())
+        .filter(p => p && !isGenericName(p));
+      const rebuilt = parts.join(' • ');
+      if (rebuilt !== cleanSenderName) {
+        cleanSenderName = rebuilt;
+        changed = true;
+      }
+    } else if (isGenericName(cleanSenderName)) {
+      cleanSenderName = cleanPersonName || cleanThreadName || '';
+      changed = true;
+    }
+  }
+
   if (!changed) {
     return { item, changed: false };
   }
@@ -348,6 +413,10 @@ function sanitizePopupRecord(item) {
     item: {
       ...item,
       text: cleanText,
+      personName: cleanPersonName,
+      threadName: cleanThreadName,
+      senderName: cleanSenderName,
+      personAliases: item.isSelf ? [] : cleanAliases,
       attachments: cleanAttachments
     },
     changed: true
@@ -638,7 +707,8 @@ function matchesKeyword(item, keyword) {
   if (!keyword) return true;
   const { person, thread } = parseRecordNames(item);
   const editStr = getRecordEditHistory(item).join(' ');
-  const hay = `${person} ${thread} ${item.senderName || ''} ${item.text || ''} ${editStr}`.toLowerCase();
+  const aliasesStr = Array.isArray(item.personAliases) ? item.personAliases.join(' ') : '';
+  const hay = `${person} ${thread} ${aliasesStr} ${item.senderName || ''} ${item.text || ''} ${editStr}`.toLowerCase();
   return hay.includes(keyword);
 }
 
