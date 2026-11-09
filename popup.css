@@ -72,7 +72,13 @@ body {
 html.is-panel,
 html.is-panel body {
   width: 100%;
+  min-width: 320px;
   height: 100vh;
+}
+
+/* Thanh bên hẹp hơn 320px (Firefox lần đầu mở khá hẹp): cuộn ngang thay vì bóp méo giao diện */
+html.is-panel {
+  overflow-x: auto;
 }
 
 /* Thanh bên đang mở: popup thu nhỏ, chỉ hiện lời nhắc */
