@@ -90,6 +90,8 @@ git clone https://github.com/binhake/fb-unsend-viewer.git
 ```
 Sau đó vào `chrome://extensions/` → Bật **Developer mode** → Chọn **Load unpacked** và trỏ tới thư mục vừa clone.
 
+> 🦊 **Firefox: thanh bên mở ở bên trái?** Firefox không cho tiện ích tự chọn vị trí thanh bên. Bấm vào tên tiện ích ở đầu thanh bên → **Chuyển thanh lề sang bên phải**, Firefox sẽ nhớ cho các lần sau (hoặc vào `about:config` đặt `sidebar.position_start` = `false`).
+
 ---
 
 ### 🛠️ Báo lỗi & Xuất nhật ký gỡ lỗi (Debug Log)
@@ -200,6 +202,8 @@ Compatible with **Google Chrome**, **Microsoft Edge**, **Brave**, **Opera**, and
 git clone https://github.com/binhake/fb-unsend-viewer.git
 ```
 Then navigate to `chrome://extensions/`, enable **Developer mode**, click **Load unpacked**, and select the cloned directory.
+
+> 🦊 **Firefox: sidebar opens on the left?** Firefox doesn't let extensions choose the sidebar side. Click the extension name at the top of the sidebar → **Move sidebar to right** and Firefox will remember it (or set `sidebar.position_start` to `false` in `about:config`).
 
 ---
 
