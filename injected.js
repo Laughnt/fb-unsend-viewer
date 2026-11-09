@@ -1082,7 +1082,8 @@
       timestamp,
       source,
       isSelf,
-      allowHistoricalCapture
+      allowHistoricalCapture,
+      replaceAttachments
     } = msgData;
     if (!messageId) return;
     const preResolvedId = resolveCanonicalMessageId(messageId);
@@ -1301,10 +1302,17 @@
       nextEditHistory.length > 0
         ? nextEditHistory[nextEditHistory.length - 1]
         : existing?.text || cleanText;
-    const rawMergedAttachments = [...(existing?.attachments || [])];
-    for (const url of cleanAttachments) {
-      if (!rawMergedAttachments.includes(url)) {
-        rawMergedAttachments.push(url);
+    const shouldReplaceExistingAttachments = Boolean(
+      replaceAttachments && cleanAttachments.length > 0
+    );
+    const rawMergedAttachments = shouldReplaceExistingAttachments
+      ? [...cleanAttachments]
+      : [...(existing?.attachments || [])];
+    if (!shouldReplaceExistingAttachments) {
+      for (const url of cleanAttachments) {
+        if (!rawMergedAttachments.includes(url)) {
+          rawMergedAttachments.push(url);
+        }
       }
     }
     const hasProgressiveVideo = rawMergedAttachments.some(
@@ -1334,7 +1342,9 @@
       (!existing.text && finalText) ||
       existing.text !== finalText ||
       nextEditHistory.length > prevHistory.length ||
-      mergedAttachments.length > (existing.attachments?.length || 0);
+      mergedAttachments.length > (existing.attachments?.length || 0) ||
+      (shouldReplaceExistingAttachments &&
+        mergedAttachments[0] !== existing.attachments?.[0]);
 
     const mergedPersonAliases = Array.from(
       new Set([...(existing?.personAliases || []), ...(resolvedNames.personAliases || [])])
@@ -1372,21 +1382,94 @@
         threadName: updatedRecord.threadName,
         source: updatedRecord.source
       });
-      emitToContentScript('FB_MSG_CAPTURED', updatedRecord);
+      emitToContentScript(
+        'FB_MSG_CAPTURED',
+        shouldReplaceExistingAttachments
+          ? { ...updatedRecord, replaceAttachments: true }
+          : updatedRecord
+      );
+      if (updatedRecord.isUnsent && shouldReplaceExistingAttachments) {
+        emitToContentScript('FB_MSG_UNSENT', {
+          ...updatedRecord,
+          replaceAttachments: true
+        });
+      }
     }
   }
 
   function triggerMessageUnsent(rawMessageId, extraInfo = {}) {
-    const messageId = resolveCanonicalMessageId(rawMessageId);
+    let messageId = resolveCanonicalMessageId(rawMessageId);
     if (!messageId) return;
     syncEditHistoryFromLSDatabase(messageId);
 
     const e2eeIds = extractIdsFromE2EEMsgId(messageId);
-    const existing =
+    let existing =
       capturedMessages.get(messageId) ||
       (e2eeIds.stanzaId && e2eeIds.stanzaId !== messageId
         ? capturedMessages.get(e2eeIds.stanzaId)
         : null);
+
+    if (/@(msgr|g\.us)\./.test(messageId)) {
+      if (!emittedRevokeMsgIds.has(messageId)) {
+        inspectE2EERavenMessagesFromMps(messageId);
+      }
+      if (!existing && typeof extraInfo.timestamp === 'number' && extraInfo.timestamp > 0) {
+        const cleanExtraThread = String(
+          extraInfo.threadId || e2eeIds.threadId || ''
+        ).replace(/@(msgr|g\.us|c\.us)$/i, '');
+        const cleanExtraSender = String(
+          extraInfo.senderId || (extraInfo.isSelf === false ? e2eeIds.peerUserId : '') || ''
+        ).replace(/@(msgr|g\.us|c\.us)$/i, '');
+        let bestDiff = 1500;
+        let matchedByTs = null;
+        for (const cand of capturedMessages.values()) {
+          if (!cand || cand.messageId === messageId) continue;
+          if (!cand.text && (!cand.attachments || cand.attachments.length === 0)) continue;
+          if (cleanExtraThread && cand.threadId && String(cand.threadId) !== cleanExtraThread) {
+            continue;
+          }
+          if (cleanExtraSender && cand.senderId && String(cand.senderId) !== cleanExtraSender) {
+            continue;
+          }
+          const diff = Math.abs((cand.timestamp || 0) - extraInfo.timestamp);
+          if (diff <= bestDiff) {
+            bestDiff = diff;
+            matchedByTs = cand;
+          }
+        }
+        if (matchedByTs && matchedByTs.messageId) {
+          aliasIdMap.set(messageId, matchedByTs.messageId);
+          if (e2eeIds.stanzaId) {
+            aliasIdMap.set(e2eeIds.stanzaId, matchedByTs.messageId);
+          }
+          const origIds = extractIdsFromE2EEMsgId(matchedByTs.messageId);
+          if (!emittedRevokeMsgIds.has(messageId)) {
+            emittedRevokeMsgIds.add(messageId);
+            const resolvedNamesForRevoke = resolveContactAndThreadName(
+              cleanExtraSender || matchedByTs.senderId || '',
+              cleanExtraThread || matchedByTs.threadId || ''
+            );
+            emitToContentScript('FB_E2EE_REVOKE_RESOLVED', {
+              revokeMsgId: messageId,
+              revokedMsgId: messageId,
+              originalMsgId: matchedByTs.messageId,
+              originalStanzaId: origIds.stanzaId || '',
+              senderId: cleanExtraSender || matchedByTs.senderId || '',
+              threadId: cleanExtraThread || matchedByTs.threadId || '',
+              personName: resolvedNamesForRevoke.personName || matchedByTs.personName || '',
+              threadName: resolvedNamesForRevoke.threadName || matchedByTs.threadName || '',
+              senderName: resolvedNamesForRevoke.senderName || matchedByTs.senderName || '',
+              avatarUrl: resolvedNamesForRevoke.avatarUrl || matchedByTs.avatarUrl || '',
+              timestampMs: extraInfo.timestamp,
+              isSelf:
+                typeof extraInfo.isSelf === 'boolean' ? extraInfo.isSelf : matchedByTs.isSelf
+            });
+          }
+          messageId = matchedByTs.messageId;
+          existing = matchedByTs;
+        }
+      }
+    }
     const noticeSenderName = extractNameFromNoticeText(extraInfo.unsendNotice || '');
 
     const finalSenderId = String(
@@ -1671,17 +1754,29 @@
     }
 
     if (
-      /^(Mps(MessageToBridge|MessageTextToBridge|MediaToBridge|RevokeMessageToBridgeMsg|XmaToBridge|NoteReplyToBridge)|MAW(BridgeBuildMsg|BridgeMsg|BridgeNewMsgHandler))(\.|$)/i.test(
+      /^(Mps(MessageToBridge|MessageTextToBridge|MediaToBridge|RevokeMessageToBridgeMsg|XmaToBridge|NoteReplyToBridge)|MAW(BridgeBuildMsg|BridgeMsg|BridgeNewMsgHandler|BridgeNewMediaHandler))(\.|$)/i.test(
         moduleName
       )
     ) {
       try {
         const arg0 = args[0];
-        const msgWrapper = arg0?.message || (typeof arg0?.deserialize === 'function' ? arg0 : null);
-        if (msgWrapper) {
+        let msgWrapper =
+          arg0?.message || (typeof arg0?.deserialize === 'function' ? arg0 : null);
+        if (!msgWrapper && arg0?.toplevelProtobuf) {
+          const wrapperMod = getFbModule('MpsMessageToBridgeWrapper');
+          if (wrapperMod?.MpsMessageToBridgeWrapper?.fromTopLevel) {
+            try {
+              msgWrapper = wrapperMod.MpsMessageToBridgeWrapper.fromTopLevel(
+                arg0.toplevelProtobuf
+              );
+            } catch (_) {}
+          }
+        }
+        if (msgWrapper || arg0?.toplevelProtobuf) {
           inspectE2EERawMessageFromMps(msgWrapper, arg0?.toplevelProtobuf ? arg0 : null);
         }
         const bridgeCandidates = [];
+        const mediaCandidates = [];
         if (returnValue && typeof returnValue === 'object') {
           if (returnValue.kind === 'bridgeMsg' && returnValue.value) {
             bridgeCandidates.push(returnValue.value);
@@ -1689,6 +1784,13 @@
             bridgeCandidates.push(returnValue.topLevel.value);
           } else if (returnValue.messageId && returnValue.timestampMs !== undefined) {
             bridgeCandidates.push(returnValue);
+          }
+          if (Array.isArray(returnValue.supplementals)) {
+            for (const sItem of returnValue.supplementals) {
+              if (sItem?.kind === 'bridgeMedia' && sItem.value) {
+                mediaCandidates.push(sItem.value);
+              }
+            }
           }
         }
         for (const a of args) {
@@ -1703,9 +1805,85 @@
             bridgeCandidates.push(a);
           } else if (a.topLevel?.kind === 'bridgeMsg' && a.topLevel?.value) {
             bridgeCandidates.push(a.topLevel.value);
+          } else if (
+            Array.isArray(a.msgIds) &&
+            (a.plaintextHash || a.offlineAttachmentId || a.mediaType)
+          ) {
+            mediaCandidates.push(a);
+          }
+        }
+        for (const mCand of mediaCandidates) {
+          const mIds = Array.isArray(mCand.msgIds) ? mCand.msgIds : [];
+          const ptHashStr = String(
+            mCand.plaintextHash || mCand.offlineAttachmentId || ''
+          ).trim();
+          const mTypeRaw = String(mCand.mediaType || '').toLowerCase();
+          const mediaType =
+            mTypeRaw.includes('video') || mTypeRaw.includes('gif')
+              ? 'video'
+              : mTypeRaw.includes('audio') || mTypeRaw.includes('ptt')
+                ? 'audio'
+                : mTypeRaw.includes('sticker')
+                  ? 'sticker'
+                  : 'image';
+          const mimeType =
+            mediaType === 'video'
+              ? 'video/mp4'
+              : mediaType === 'audio'
+                ? 'audio/ogg'
+                : mediaType === 'sticker'
+                  ? 'image/webp'
+                  : 'image/jpeg';
+          const cleanThreadId = String(mCand.threadJid || '').replace(
+            /@(msgr|g\.us|c\.us)$/i,
+            ''
+          );
+          for (const rawMid of mIds) {
+            const fullMid = String(rawMid || '').trim();
+            if (!fullMid) continue;
+            const eIds = extractIdsFromE2EEMsgId(fullMid);
+            const sortTs =
+              Number(mCand.messagesSortOrderMs?.[fullMid]) ||
+              (typeof mCand.ts === 'number' && mCand.ts > 0 ? mCand.ts * 1000 : Date.now());
+            if (/@(msgr|g\.us)\./.test(fullMid)) {
+              inspectE2EERavenMessagesFromMps(fullMid);
+            }
+            if (ptHashStr) {
+              resolveFullE2EEAttachmentMedia(
+                fullMid,
+                eIds.stanzaId || '',
+                null,
+                null,
+                null,
+                mediaType,
+                mimeType,
+                {
+                  senderId: '',
+                  threadId: cleanThreadId || eIds.threadId || '',
+                  timestamp: sortTs
+                },
+                ptHashStr
+              );
+            }
           }
         }
         for (const bMsg of bridgeCandidates) {
+          const bMid = String(bMsg.msgId || bMsg.messageId || '').trim();
+          if (bMid && /@(msgr|g\.us)\./.test(bMid)) {
+            const bType = String(bMsg.type_ || bMsg.type || '').toLowerCase();
+            if (
+              bType === 'revoked' ||
+              bType === 'unsent' ||
+              bType === 'image' ||
+              bType === 'video' ||
+              bType === 'gif' ||
+              bType === 'ptt' ||
+              bType === 'audio' ||
+              bType === 'sticker'
+            ) {
+              inspectE2EERavenMessagesFromMps(bMid);
+            }
+          }
           inspectPlainObject(bMsg, 0, {
             fromRealtime: true,
             currentFunc: moduleName,
@@ -2564,6 +2742,149 @@
   }
 
   const emittedRevokeMsgIds = new Set();
+  const resolvedFullE2EEMediaMsgIds = new Set();
+  const inFlightFullE2EEMediaMsgIds = new Set();
+
+  function applyE2EEAttachmentMedia(fullMsgId, stanzaId, urls, meta = {}, replaceAttachments = false) {
+    if (!fullMsgId || !Array.isArray(urls) || urls.length === 0) return;
+    registerCapturedMessage({
+      messageId: fullMsgId,
+      altIds: [stanzaId].filter(Boolean),
+      text: meta.captionText || '',
+      senderId: meta.senderId || '',
+      threadId: meta.threadId || '',
+      isSelf: meta.isSelf,
+      attachments: urls,
+      timestamp: meta.timestamp || Date.now(),
+      source: 'MpsOverBridge-E2EE-Media',
+      allowHistoricalCapture: true,
+      replaceAttachments
+    });
+  }
+
+  async function resolveFullE2EEAttachmentMedia(
+    fullMsgId,
+    stanzaId,
+    tIntegral,
+    tAncillary,
+    thumbObj,
+    mediaType,
+    mimeType,
+    meta = {},
+    plaintextHashStr = null
+  ) {
+    if (!fullMsgId || resolvedFullE2EEMediaMsgIds.has(fullMsgId)) return;
+    const lockKey = `${fullMsgId}_${tIntegral?.directPath ? 'transport' : 'hash'}`;
+    if (inFlightFullE2EEMediaMsgIds.has(lockKey)) return;
+    inFlightFullE2EEMediaMsgIds.add(lockKey);
+
+    try {
+      const effectiveMime =
+        tAncillary?.mimetype ||
+        mimeType ||
+        (mediaType === 'video'
+          ? 'video/mp4'
+          : mediaType === 'audio'
+            ? 'audio/ogg'
+            : mediaType === 'sticker'
+              ? 'image/webp'
+              : 'image/jpeg');
+      const hkdfType =
+        mediaType === 'video' ? 'video' : mediaType === 'audio' ? 'audio' : 'image';
+
+      if (tIntegral?.directPath && tIntegral?.mediaKey) {
+        const decryptedDataUrl = await decryptWhatsAppMediaFromTransport(
+          tIntegral,
+          hkdfType,
+          effectiveMime
+        );
+        if (decryptedDataUrl) {
+          resolvedFullE2EEMediaMsgIds.add(fullMsgId);
+          applyE2EEAttachmentMedia(fullMsgId, stanzaId, [decryptedDataUrl], meta, true);
+          return;
+        }
+      }
+
+      const bridgeSendMod = getFbModule('MAWBridgeSendAndReceive');
+      const fireMod = getFbModule('MAWBridgeFireAndForget');
+      const hashUtilsMod = getFbModule('WAHashUtils');
+      let ptHash = null;
+      if (tIntegral?.fileSha256 && hashUtilsMod?.toPlaintextHash) {
+        try {
+          ptHash = hashUtilsMod.toPlaintextHash(tIntegral.fileSha256);
+        } catch (_) {}
+      }
+      if (!ptHash && plaintextHashStr) {
+        if (hashUtilsMod?.stringToPlaintextHash) {
+          try {
+            ptHash = hashUtilsMod.stringToPlaintextHash(plaintextHashStr);
+          } catch (_) {
+            ptHash = plaintextHashStr;
+          }
+        } else {
+          ptHash = plaintextHashStr;
+        }
+      }
+
+      if (ptHash && bridgeSendMod?.sendAndReceive) {
+        if (fireMod?.fireAndForget) {
+          try {
+            fireMod.fireAndForget('backend', 'downloadMediaForUI', {
+              downloadType: 'media',
+              msgType: null,
+              plaintextHash: ptHash,
+              triggerUIView: true,
+              type: 'plaintextHash'
+            });
+          } catch (_) {}
+        }
+
+        const tryFetchWorkerBlob = async () => {
+          try {
+            const blobRes = await bridgeSendMod.sendAndReceive(
+              'backend',
+              'getBlobDataUrlByPlaintextHash',
+              { description: 'fb_unsend_e2ee', plaintextHash: ptHash }
+            );
+            if (blobRes instanceof Blob && blobRes.size > 0) {
+              const arrBuf = await blobRes.arrayBuffer();
+              const dataUrl = bytesToDataUrl(arrBuf, blobRes.type || effectiveMime);
+              if (dataUrl) {
+                resolvedFullE2EEMediaMsgIds.add(fullMsgId);
+                applyE2EEAttachmentMedia(fullMsgId, stanzaId, [dataUrl], meta, true);
+                return true;
+              }
+            } else if (typeof blobRes === 'string' && blobRes.length > 0) {
+              resolvedFullE2EEMediaMsgIds.add(fullMsgId);
+              applyE2EEAttachmentMedia(fullMsgId, stanzaId, [blobRes], meta, true);
+              return true;
+            }
+          } catch (_) {}
+          return false;
+        };
+
+        if (await tryFetchWorkerBlob()) return;
+        await new Promise((r) => setTimeout(r, 350));
+        if (resolvedFullE2EEMediaMsgIds.has(fullMsgId) || (await tryFetchWorkerBlob())) return;
+        await new Promise((r) => setTimeout(r, 950));
+        if (resolvedFullE2EEMediaMsgIds.has(fullMsgId) || (await tryFetchWorkerBlob())) return;
+      }
+
+      if (!resolvedFullE2EEMediaMsgIds.has(fullMsgId) && thumbObj?.downloadableThumbnail) {
+        const dlThumbUrl = await decryptWhatsAppMediaFromTransport(
+          thumbObj.downloadableThumbnail,
+          'image',
+          'image/jpeg'
+        );
+        if (dlThumbUrl) {
+          applyE2EEAttachmentMedia(fullMsgId, stanzaId, [dlThumbUrl], meta, true);
+        }
+      }
+    } catch (_) {
+    } finally {
+      inFlightFullE2EEMediaMsgIds.delete(lockKey);
+    }
+  }
 
   function extractRevokedStanzaIdFromBytes(payloadBytes, currentStanzaId = '') {
     try {
@@ -2621,9 +2942,11 @@
       const consumerMsg = topEnc?.consumerMessage?.();
       const revokeObj = consumerMsg?.payload?.applicationData?.revoke || null;
       const textObj = consumerMsg?.payload?.content?.messageText || null;
+      const attObj =
+        consumerMsg?.attachmentMessage?.() || consumerMsg?.stickerMessage?.() || null;
 
       let revokedStanzaId = String(revokeObj?.key?.id || '').trim();
-      if (!revokedStanzaId && !textObj?.text && topProto?.payload) {
+      if (!revokedStanzaId && !textObj?.text && !attObj?.payload && topProto?.payload) {
         const asciiCheck = safeDecodeBuffer(topProto.payload);
         if (asciiCheck && /@(msgr|g\.us)/.test(asciiCheck) && asciiCheck.length <= 160) {
           revokedStanzaId = extractRevokedStanzaIdFromBytes(topProto.payload, stanzaId);
@@ -2667,6 +2990,97 @@
         };
       }
 
+      if (attObj?.payload) {
+        const attPayload = attObj.payload;
+        const waTransport =
+          attPayload?.integral?.transport || attPayload?.transport || attPayload;
+        const tIntegral = waTransport?.integral;
+        const tAncillary = waTransport?.ancillary;
+        const thumbObj = tAncillary?.thumbnail;
+        const rawCaption = attPayload?.ancillary?.caption;
+        const captionText =
+          typeof rawCaption === 'string' && !isTechnicalString(rawCaption)
+            ? unvaultString(rawCaption).trim()
+            : '';
+
+        let serverMediaType = '';
+        try {
+          const mediaTypeMod = getFbModule('getMediaTypeFromConsumerMessage');
+          if (mediaTypeMod?.getMediaTypeFromConsumerMessage && consumerMsg?.proto) {
+            serverMediaType = String(
+              mediaTypeMod.getMediaTypeFromConsumerMessage(consumerMsg.proto) || ''
+            ).toLowerCase();
+          }
+        } catch (_) {}
+
+        const rawMime = String(tAncillary?.mimetype || '').toLowerCase();
+        const mediaType =
+          serverMediaType === 'video' ||
+          serverMediaType === 'gif' ||
+          rawMime.startsWith('video/')
+            ? 'video'
+            : serverMediaType === 'ptt' ||
+                serverMediaType === 'audio' ||
+                rawMime.startsWith('audio/')
+              ? 'audio'
+              : serverMediaType === 'sticker' || Boolean(consumerMsg?.stickerMessage?.())
+                ? 'sticker'
+                : 'image';
+        const mimeType =
+          tAncillary?.mimetype ||
+          (mediaType === 'video'
+            ? 'video/mp4'
+            : mediaType === 'audio'
+              ? 'audio/ogg'
+              : mediaType === 'sticker'
+                ? 'image/webp'
+                : 'image/jpeg');
+
+        const thumbDataUrl = thumbObj?.jpegThumbnail
+          ? bytesToDataUrl(thumbObj.jpegThumbnail, 'image/jpeg')
+          : null;
+        const mediaMeta = {
+          captionText,
+          senderId: cleanSenderId,
+          threadId: cleanThreadId,
+          isSelf: isAuthorMe,
+          timestamp: timestampMs
+        };
+
+        if (thumbDataUrl || captionText) {
+          applyE2EEAttachmentMedia(
+            fullMsgId,
+            stanzaId,
+            thumbDataUrl ? [thumbDataUrl] : [],
+            mediaMeta,
+            false
+          );
+        }
+
+        resolveFullE2EEAttachmentMedia(
+          fullMsgId,
+          stanzaId,
+          tIntegral,
+          tAncillary,
+          thumbObj,
+          mediaType,
+          mimeType,
+          mediaMeta,
+          null
+        );
+
+        return {
+          type: mediaType,
+          msgId: fullMsgId,
+          text: captionText,
+          hasThumb: Boolean(thumbDataUrl),
+          senderId: cleanSenderId,
+          threadId: cleanThreadId,
+          timestampMs,
+          isSelf: isAuthorMe
+        };
+      }
+
       const rawText = typeof textObj?.text === 'string' ? unvaultString(textObj.text).trim() : '';
       const specialSize = consumerMsg?.metadata?.specialTextSize;
       const finalText =
@@ -2697,6 +3111,8 @@
     } catch (_) {}
     return null;
   }
+
+  const probedE2EEThreadTimeMap = new Map();
 
   async function inspectE2EERavenMessagesFromMps(fullMsgId) {
     try {
@@ -2729,14 +3145,15 @@
       }
 
       let listRes = null;
-      const threadListKey = `thread_list_${threadId}`;
-      if (!probedE2EEThreads.has(threadListKey)) {
-        probedE2EEThreads.add(threadListKey);
+      const nowMs = Date.now();
+      const lastThreadListProbeAt = probedE2EEThreadTimeMap.get(threadId) || 0;
+      if (nowMs - lastThreadListProbeAt > 2500) {
+        probedE2EEThreadTimeMap.set(threadId, nowMs);
         listRes = await mpsInstance.loadMessages({
           config: { shouldFetchSupplementals: true, useMessageVisibility: true },
           debug: { purpose: 'load-more' },
           direction: 'desc',
-          from: [Date.now() + 86400000, stanzaId],
+          from: [nowMs + 86400000, stanzaId],
           numMessages: 25,
           threadId
         });
@@ -2747,6 +3164,14 @@
         rawMsgs.push(singleRes.value);
       } else if (singleRes?.value?.message?.toplevelProtobuf) {
         rawMsgs.push(singleRes.value.message);
+      } else if (singleRes?.value?.message?.payload) {
+        rawMsgs.push({
+          toplevelProtobuf: singleRes.value.message,
+          supplementalProtobufs:
+            singleRes.value.supplementalMessages ||
+            singleRes.value.supplementalProtobufs ||
+            null
+        });
       }
       if (Array.isArray(listRes?.value?.messages)) {
         for (const m of listRes.value.messages) {
@@ -3289,6 +3714,7 @@
               threadId,
               senderName,
               isSelf,
+              timestamp,
               source: context.source
             });
           } else {

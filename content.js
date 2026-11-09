@@ -1970,16 +1970,38 @@
         if (/avatar|poster|thumb|mediaurl|finalurl/i.test(lowerKey) || /^(https?:|data:|blob:)/i.test(val)) {
           return maskMediaUrl(val);
         }
-        if (/^(senderid|threadid|currentuserid|contactid|userid|authorid)$/i.test(lowerKey)) {
+        if (/^(senderid|threadid|currentuserid|contactid|userid|authorid|snippetsendercontactid)$/i.test(lowerKey)) {
           return maskUid(val);
         }
-        if (/^(sendername|personname|threadname|rowsendername|currentuserfullname|nickname)$/i.test(lowerKey)) {
+        if (/^(sender|author)$/i.test(lowerKey)) {
+          if (/^\d{6,25}$/.test(val.trim())) return maskUid(val);
+          if (/^\d{6,25}@(?:msgr|g\.us)/i.test(val.trim())) return maskMsgId(val);
+        }
+        if (/^(sendername|personname|threadname|rowsendername|currentuserfullname|nickname|anchorabovesender|fbunsendsavedsender)$/i.test(lowerKey)) {
           return maskName(val);
         }
-        if (/^(messageid|originalmessageid|revokemessageid|fibermsgid|msgid|fbmsgid)$/i.test(lowerKey)) {
+        if (/^(messageid|originalmessageid|revokemessageid|fibermsgid|msgid|fbmsgid|fbunsendsavedmid|fbunsendrestoredmid|fbunsendmatchedid|chatjid|threadjid)$/i.test(lowerKey)) {
           return maskMsgId(val);
         }
-        if (/^(text|rawtext|rawrowtext|anchortext|unsendnotice|noticeeltext|bodypreview|decodedtext)$/i.test(lowerKey)) {
+        if (lowerKey === 'fbunsendsavededithistory') {
+          try {
+            const parsed = JSON.parse(val);
+            if (Array.isArray(parsed)) {
+              return JSON.stringify(parsed.map((item) => maskTextContent(String(item || ''))));
+            }
+          } catch (_) {}
+          return maskTextContent(val);
+        }
+        if (lowerKey === 'fbunsendsavedmedia') {
+          try {
+            const parsed = JSON.parse(val);
+            if (Array.isArray(parsed)) {
+              return JSON.stringify(parsed.map((item) => maskMediaUrl(String(item || ''))));
+            }
+          } catch (_) {}
+          return maskMediaUrl(val);
+        }
+        if (/^(text|rawtext|rawrowtext|anchortext|anchorabovetext|fbunsendsavedtext|fbunsendcommunityanchor|unsendnotice|noticeeltext|bodypreview|decodedtext|content)$/i.test(lowerKey)) {
           return maskTextContent(val);
         }
         if (/^\d{6,25}@(?:msgr|g\.us)\.\d+$/.test(val)) {
@@ -2408,10 +2430,13 @@
       msg.senderName || existing?.senderName || ''
     );
 
-    const combinedAttachments = sanitizeAttachmentsList([
-      ...(msg.attachments || []),
-      ...(existing?.attachments || [])
-    ]);
+    const combinedAttachments =
+      msg.replaceAttachments && Array.isArray(msg.attachments) && msg.attachments.length > 0
+        ? sanitizeAttachmentsList(msg.attachments)
+        : sanitizeAttachmentsList([
+            ...(msg.attachments || []),
+            ...(existing?.attachments || [])
+          ]);
 
     const earliestTimestamp =
       existing?.timestamp && msg.timestamp
@@ -2490,7 +2515,12 @@
     });
 
     const isBrandNew =
-      !existing || (!existing.text && merged.text) || historyGrew || existing.text !== merged.text;
+      !existing ||
+      (!existing.text && merged.text) ||
+      historyGrew ||
+      existing.text !== merged.text ||
+      (merged.attachments?.length || 0) > (existing?.attachments?.length || 0) ||
+      Boolean(msg.replaceAttachments && merged.attachments?.[0] !== existing?.attachments?.[0]);
 
     const oldExistingId = existing?.messageId || '';
     if (oldExistingId && oldExistingId !== bestId) {
@@ -2530,14 +2560,28 @@
       Object.assign(existing, merged);
       delete existing.rowEl;
       delete existing.chatContainer;
+      delete existing.replaceAttachments;
       targetRec = existing;
       if (!recentByIdMap.has(bestId) && !existing.isUnsent) {
         recentMessagesList.push(targetRec);
       }
     } else {
+      delete targetRec.replaceAttachments;
       recentMessagesList.push(targetRec);
     }
     indexRecordLookupKeys(targetRec, Boolean(targetRec.isUnsent));
+
+    if (
+      (targetRec.isUnsent || unsentByIdMap.has(bestId)) &&
+      targetRec.attachments &&
+      targetRec.attachments.length > 0
+    ) {
+      upsertUnsentRecord({
+        ...targetRec,
+        replaceAttachments: Boolean(msg.replaceAttachments),
+        isUnsent: true
+      });
+    }
 
     if (isBrandNew) {
       dlog('CAPTURED', '#4cd137', {
@@ -2602,10 +2646,13 @@
           ? oldId
           : newRecord.messageId || oldId;
 
-      const mergedAttachments = sanitizeAttachmentsList([
-        ...cleanAttachments,
-        ...(existingItem.attachments || [])
-      ]);
+      const mergedAttachments =
+        newRecord.replaceAttachments && cleanAttachments.length > 0
+          ? cleanAttachments
+          : sanitizeAttachmentsList([
+              ...cleanAttachments,
+              ...(existingItem.attachments || [])
+            ]);
 
       const bestPerson =
         chooseBestPersonName(newRecord.personName, existingItem.personName) ||
@@ -2713,6 +2760,7 @@
         isUnsent: true
       });
 
+      delete merged.replaceAttachments;
       unsentMessagesList[existingIdx] = merged;
       if (oldId && oldId !== bestId) {
         messagesById.delete(oldId);
@@ -2725,6 +2773,23 @@
       }
       merged.updatedAt = Date.now();
       indexRecordLookupKeys(merged, true);
+      if (merged.attachments && merged.attachments.length > 0 && document.body) {
+        document
+          .querySelectorAll('div[data-scope="messages_table"][data-fb-unsend-restored="true"]')
+          .forEach((rowEl) => {
+            const matchedId =
+              rowEl.dataset?.fbUnsendMatchedId ||
+              rowEl.dataset?.fbUnsendRestoredMid ||
+              getRowMessageId(rowEl) ||
+              '';
+            if (matchedId && isSameAuthoritativeRecordId(matchedId, merged)) {
+              const noticeEl = analyzeChatRow(rowEl).unsentNoticeEl;
+              if (noticeEl) {
+                renderRestoredContentInDom(rowEl, noticeEl, merged);
+              }
+            }
+          });
+      }
       dlog('UNSENT-MERGED', '#00cec9', 'Cập nhật bản ghi gỡ đã có trong History:', merged);
       updateActiveToastIfPresent(merged);
       saveToStorage({ recent: false, unsent: true, immediate: true });
@@ -2923,10 +2988,15 @@
       domMatchedRowRec?.text ||
       unsentData.text ||
       '';
-    const originalAttachments = sanitizeAttachmentsList([
-      ...(existing?.attachments || []),
-      ...(unsentData.attachments || [])
-    ]);
+    const originalAttachments =
+      unsentData.replaceAttachments &&
+      Array.isArray(unsentData.attachments) &&
+      unsentData.attachments.length > 0
+        ? sanitizeAttachmentsList(unsentData.attachments)
+        : sanitizeAttachmentsList([
+            ...(existing?.attachments || []),
+            ...(unsentData.attachments || [])
+          ]);
 
     const noticePerson = extractNameFromNotice(unsentData.unsendNotice);
     const earlySenderId = existing?.senderId || unsentData.senderId || '';
@@ -6024,6 +6094,28 @@
           existingSpan.textContent = displayText;
         }
       }
+      if (cleanAttachments.length > 0) {
+        const { renderUrls, posterUrl } = splitVideoPosterFromAttachments(cleanAttachments);
+        const serialized = JSON.stringify(renderUrls);
+        let mediaContainer = targetContainer.querySelector('.fb-unsend-media-list');
+        if (mediaContainer) {
+          if (mediaContainer.dataset.fbRenderedMedia !== serialized) {
+            mediaContainer.textContent = '';
+            mediaContainer.dataset.fbRenderedMedia = serialized;
+            renderUrls.forEach((url) => {
+              mediaContainer.appendChild(createRestoredMediaElement(url, false, posterUrl));
+            });
+          }
+        } else {
+          mediaContainer = document.createElement('div');
+          mediaContainer.className = 'fb-unsend-media-list';
+          mediaContainer.dataset.fbRenderedMedia = serialized;
+          renderUrls.forEach((url) => {
+            mediaContainer.appendChild(createRestoredMediaElement(url, false, posterUrl));
+          });
+          targetContainer.appendChild(mediaContainer);
+        }
+      }
       return;
     }
 
@@ -6058,6 +6150,7 @@
       const { renderUrls, posterUrl } = splitVideoPosterFromAttachments(cleanAttachments);
       const mediaContainer = document.createElement('div');
       mediaContainer.className = 'fb-unsend-media-list';
+      mediaContainer.dataset.fbRenderedMedia = JSON.stringify(renderUrls);
       renderUrls.forEach((url) => {
         mediaContainer.appendChild(createRestoredMediaElement(url, false, posterUrl));
       });

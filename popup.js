@@ -1529,8 +1529,16 @@ function sanitizePopupDebugRecord(rec, nameMap, uidMap) {
     if (typeof t !== 'string' || !t.trim()) return '';
     return `[REDACTED_TEXT len=${t.trim().length}]`;
   };
+  const maskMsgId = idVal => {
+    if (typeof idVal !== 'string') return idVal;
+    return idVal.replace(/^(\d{6,25})(@(?:msgr|g\.us))/, (_m, uid, domain) => `${maskUid(uid)}${domain}`);
+  };
   return {
     ...rec,
+    messageId: rec.messageId ? maskMsgId(rec.messageId) : rec.messageId,
+    originalMessageId: rec.originalMessageId ? maskMsgId(rec.originalMessageId) : rec.originalMessageId,
+    revokeMessageId: rec.revokeMessageId ? maskMsgId(rec.revokeMessageId) : rec.revokeMessageId,
+    fiberMsgId: rec.fiberMsgId ? maskMsgId(rec.fiberMsgId) : rec.fiberMsgId,
     senderId: maskUid(rec.senderId),
     threadId: maskUid(rec.threadId),
     personName: maskName(rec.personName),
@@ -1540,6 +1548,8 @@ function sanitizePopupDebugRecord(rec, nameMap, uidMap) {
     avatarUrl: rec.avatarUrl ? maskUrl(rec.avatarUrl) : '',
     text: maskText(rec.text),
     anchorText: rec.anchorText ? maskText(rec.anchorText) : undefined,
+    anchorAboveText: rec.anchorAboveText ? maskText(rec.anchorAboveText) : undefined,
+    anchorAboveSender: rec.anchorAboveSender ? maskName(rec.anchorAboveSender) : undefined,
     editHistory: Array.isArray(rec.editHistory) ? rec.editHistory.map(maskText) : undefined,
     attachments: Array.isArray(rec.attachments) ? rec.attachments.map(maskUrl) : []
   };

@@ -8,7 +8,7 @@
 
   <p>
     <img src="https://img.shields.io/badge/Manifest-V3-2563eb?style=flat-square&logo=googlechrome&logoColor=white" alt="Manifest V3" />
-    <img src="https://img.shields.io/badge/Version-1.3.1-7c3aed?style=flat-square" alt="Version 1.3.1" />
+    <img src="https://img.shields.io/badge/Version-1.3.2-7c3aed?style=flat-square" alt="Version 1.3.2" />
     <img src="https://img.shields.io/badge/Privacy-100%25%20Local-10b981?style=flat-square" alt="100% Local Privacy" />
     <img src="https://img.shields.io/badge/License-Non--Commercial%20(by%20binhake)-ef4444?style=flat-square" alt="License Non-Commercial (by binhake)" />
   </p>
