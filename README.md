@@ -74,7 +74,7 @@
 Bạn có thể cài đặt trên **Google Chrome**, **Microsoft Edge**, **Brave**, **Cốc Cốc**, hoặc bất kỳ trình duyệt nhân Chromium nào.
 
 #### Cách 1: Tải bản đóng gói sẵn (Khuyên dùng)
-1. Truy cập mục [**Releases**](../../releases) ở góc phải trang GitHub này và tải tệp `fb-unsend-viewer-v1.3.1.zip` mới nhất.
+1. Truy cập mục [**Releases**](../../releases) ở góc phải trang GitHub này và tải tệp `fb-unsend-viewer-v1.3.2.zip` mới nhất.
 2. Giải nén tệp `.zip` ra một thư mục cố định trên máy tính.
 3. Mở trình duyệt và truy cập đường dẫn quản lý tiện ích:
    - **Chrome**: `chrome://extensions/`
@@ -187,7 +187,7 @@ Dự án thuộc quyền sở hữu trí tuệ và bản quyền của **[binhak
 Compatible with **Google Chrome**, **Microsoft Edge**, **Brave**, **Opera**, and all Chromium-based browsers.
 
 #### Option 1: Download from Releases (Recommended)
-1. Go to the [**Releases**](../../releases) page and download the latest `fb-unsend-viewer-v1.3.1.zip`.
+1. Go to the [**Releases**](../../releases) page and download the latest `fb-unsend-viewer-v1.3.2.zip`.
 2. Extract the `.zip` archive to a permanent folder on your computer.
 3. Open your browser's extensions page:
    - **Chrome**: `chrome://extensions/`
